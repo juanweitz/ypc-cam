@@ -370,6 +370,30 @@ async function connectUsb() {
     return false;
   }
 
+  // With no camera chosen, the browser opens the system default — which is
+  // usually the laptop's own webcam. Prefer the YPC when it is plugged in.
+  if (!cfg.usbDevice) {
+    try {
+      const devs = await navigator.mediaDevices.enumerateDevices();
+      const want = devs.find((d) => d.kind === 'videoinput' && /usb 2\.0 camera|lihappe|ypc/i.test(d.label));
+      const current = stream.getVideoTracks()[0]?.getSettings?.().deviceId;
+      if (want && want.deviceId && want.deviceId !== current) {
+        const better = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: { deviceId: { exact: want.deviceId } },
+        });
+        stream.getTracks().forEach((t) => t.stop());
+        stream = better;
+        cfg.usbDevice = want.deviceId;
+        saveCfg();
+        fillUsbChoices($('usbDevice'), devs, cfg.usbDevice);
+        log(`Using ${want.label} (not the default camera).`);
+      }
+    } catch (err) {
+      log(`Camera auto-select failed: ${err.name}`, 'error');
+    }
+  }
+
   state.usbStream = stream;
   const track = stream.getVideoTracks()[0];
   const settings = track.getSettings ? track.getSettings() : {};
