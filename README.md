@@ -4,17 +4,29 @@ A single-page, dependency-free controller for the **YPC99** Wi-Fi camera, built
 because the vendor app doesn't work. It talks straight to the camera's built-in
 web API — no cloud, no account, no server-side code.
 
+The same camera works two ways:
+
+* **Wi-Fi** — the page talks to `http://192.168.1.1:36299` (the camera's own
+  access point). Slower, and the firmware's snapshot engine is fragile.
+* **USB** — plugged in by USB the camera enumerates as an ordinary **UVC
+  webcam**, so it can be read at full frame rate with no Wi-Fi at all. The page
+  uses the browser's camera API for this, and `capture.py` records from it from
+  the command line.
+
 ```
 ypc-cam/
-├── index.html   markup
-├── style.css    styling
-└── app.js       camera API + video pipeline
+├── index.html            markup
+├── style.css             styling
+├── app.js                camera API + video pipeline (Wi-Fi and USB)
+├── capture.py            command-line capture over USB
+├── manifest.webmanifest  PWA metadata
+└── sw.js                 offline app shell
 ```
 
 ## Running it
 
-The camera serves its API over plain HTTP, so open the page over HTTP too
-(a page loaded from `https://` would be blocked as mixed content):
+Serve the folder over plain HTTP — the browser needs this for both the Wi-Fi
+API and for USB camera access:
 
 ```bash
 cd ypc-cam
@@ -22,6 +34,9 @@ python3 -m http.server 8000
 ```
 
 Then visit <http://localhost:8000>.
+
+Then choose the source in **Settings → Source**: *Wi-Fi camera* or *USB camera*.
+The choice is remembered.
 
 ### Install it as an app
 
@@ -33,9 +48,9 @@ your app launcher.
 The service worker caches the UI, so the installed app still opens when the
 local server is not running; camera traffic is never intercepted.
 
-Install it from `http://localhost`, not from the GitHub Pages URL: an app
-installed from Pages runs at an HTTPS origin and hits the same mixed-content
-block described below.
+Install it from `http://localhost`. Cameras are per-origin, so the installed app
+keeps the camera permission you granted, and the USB source works there just as
+it does in a tab.
 
 On first load you get a connection dialog. Defaults are already correct for
 this camera:
@@ -52,6 +67,37 @@ You can also pass them in the URL:
 ```
 http://localhost:8000/?host=192.168.1.1&port=36299&user=admin&pwd=
 ```
+
+## USB camera mode
+
+Plugged in over USB the camera presents itself as a standard UVC webcam
+(`038f:6001`, "USB 2.0 Camera" by lihappe8 Corp.), so Linux drives it with
+`uvcvideo` and nothing proprietary is involved.
+
+**In the page:** Settings → Source → *USB camera* → Connect. The video is drawn
+to the same canvas as the Wi-Fi path, so Snapshot, Record and Fullscreen work
+unchanged. Recording uses the camera stream directly, at native resolution and
+frame rate.
+
+**From the command line:** `capture.py` drives GStreamer, so there is nothing to
+install if `gst-launch-1.0` is present.
+
+```bash
+./capture.py list            # what video devices exist
+./capture.py diagnose        # why a plugged-in camera has no frames
+./capture.py snap            # one JPEG
+./capture.py record          # MP4 until Ctrl-C
+./capture.py record --seconds 60 --size 1280x720 --bitrate 6000
+./capture.py preview         # live window
+```
+
+Files are written next to the script as `ypc-<date>-<time>.jpg` / `.mp4`;
+use `-o` to choose a name, or `--device /dev/video2` / `--name "USB 2.0
+Camera"` to pick the device.
+
+USB is the better path when the Wi-Fi module misbehaves: no access point to
+join, no snapshot engine to overflow, and a real 30 fps stream instead of
+polled JPEGs.
 
 ## How it works
 
@@ -89,8 +135,10 @@ plain static site possible.
 
 ### Recording
 
-`canvas.captureStream()` + `MediaRecorder` produce a WebM file. Snapshots are
-saved as JPEG. Everything happens locally in the browser.
+`canvas.captureStream()` (Wi-Fi) or the camera's own `MediaStream` (USB) feeds
+`MediaRecorder`, producing a WebM file. Snapshots are saved as JPEG — taken from
+the frame already on screen, which avoids asking the Wi-Fi camera for a second
+image. Everything happens locally in the browser.
 
 ## Notes
 
@@ -122,6 +170,17 @@ the camera for a few seconds and plug it back in. It happens when two clients
 poll snapshots at the same time — the page now pauses background tabs and only
 lets one tab hold the camera, but a phone app or a second device can still
 trigger it.
+
+**USB: "Cannot enable. Maybe the USB cable is bad?"** The kernel sees the camera
+announce itself and then fails to bring it up. That is the cable or the port, not
+the software: use a cable that carries data (many micro-USB cables are
+charge-only) and plug straight into the machine rather than a hub. Check with
+`./capture.py diagnose`.
+
+**USB: nothing happens / permission denied.** The page must be opened from
+`http://localhost:8000`; browsers refuse camera access on `file://` and over
+plain HTTP on a non-localhost address. If the browser asks for camera
+permission, allow it and press Connect again.
 
 ## Hosting
 

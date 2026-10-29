@@ -32,6 +32,7 @@
   <section class="stage">
     <div class="viewport" id="viewport">
       <img id="mjpeg" alt="" hidden>
+      <video id="usb" playsinline muted autoplay hidden></video>
       <canvas id="canvas" width="640" height="480"></canvas>
       <div class="overlay" id="overlay">
         <div class="spinner"></div>
@@ -59,7 +60,17 @@
     </nav>
 
     <div class="tabpane active" id="pane-camera">
-      <div class="group">
+      <div class="group" data-usb-only>
+        <h2>USB camera</h2>
+        <label class="row">
+          <span>Device</span>
+          <select id="usbDevice"></select>
+        </label>
+        <button class="btn wide" id="btnRescan">Rescan devices</button>
+        <p class="hint">Plugged in by USB the camera acts as a normal webcam: full frame rate, no Wi-Fi.</p>
+      </div>
+
+      <div class="group" data-wifi-only>
         <h2>Pan / Tilt</h2>
         <div class="dpad" id="dpad">
           <button data-cmd="0" data-stop="1" class="pad up" aria-label="Up">▲</button>
@@ -71,7 +82,7 @@
         <p class="hint" id="ptzHint">Hold a direction to move, release to stop.</p>
       </div>
 
-      <div class="group">
+      <div class="group" data-wifi-only>
         <h2>Image</h2>
         <label class="row">
           <span>Brightness</span>
@@ -102,7 +113,7 @@
         </label>
       </div>
 
-      <div class="group">
+      <div class="group" data-wifi-only>
         <h2>Stream</h2>
         <label class="row">
           <span>Refresh</span>
@@ -115,7 +126,7 @@
         <p class="hint">Frame size reported by the camera: <strong id="frameSize">—</strong></p>
       </div>
 
-      <div class="group">
+      <div class="group" data-wifi-only>
         <h2>Device</h2>
         <label class="row">
           <span>Name</span>
@@ -164,8 +175,24 @@
   <form method="dialog" id="settingsForm">
     <h2>Camera connection</h2>
     <label class="field">
+      <span>Source</span>
+      <select id="cfgSource">
+        <option value="wifi">Wi-Fi camera (HTTP)</option>
+        <option value="usb">USB camera (this computer)</option>
+      </select>
+    </label>
+    <div id="usbFields" hidden>
+      <label class="field">
+        <span>USB camera</span>
+        <select id="cfgUsbDevice"><option value="">Default camera</option></select>
+      </label>
+      <p class="hint" id="usbHint">The camera must be plugged in by USB. USB mode needs this page served from
+        <code>http://localhost:8000</code> — browsers refuse camera access on <code>file://</code>.</p>
+    </div>
+    <div id="wifiFields">
+    <label class="field">
       <span>Address</span>
-      <input id="cfgHost" required placeholder="192.168.1.1" autocomplete="off">
+      <input id="cfgHost" placeholder="192.168.1.1" autocomplete="off">
     </label>
     <label class="field">
       <span>Port</span>
@@ -180,6 +207,7 @@
       <input id="cfgPwd" type="password" placeholder="(empty)" autocomplete="current-password">
     </label>
     <p class="hint">The camera is an open access point. Credentials never leave your browser.</p>
+    </div>
     <div class="dlg-actions">
       <button value="cancel" class="btn ghost" formnovalidate>Cancel</button>
       <button value="save" class="btn" id="btnSaveCfg">Connect</button>

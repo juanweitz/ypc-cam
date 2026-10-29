@@ -226,6 +226,10 @@ code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-si
 .group { padding-bottom: 16px; margin-bottom: 16px; border-bottom: 1px solid var(--line); }
 .group:last-child { border-bottom: 0; margin-bottom: 0; padding-bottom: 0; }
 
+/* The Wi-Fi and USB sources expose different controls. */
+body.usb [data-wifi-only],
+body:not(.usb) [data-usb-only] { display: none; }
+
 .hint { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
 .row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
 .row > span { flex: 0 0 84px; color: var(--muted); font-size: 13px; }

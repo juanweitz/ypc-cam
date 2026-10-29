@@ -25,6 +25,8 @@ const DEFAULTS = {
   port: '36299',
   user: 'admin',
   pwd: '',
+  source: 'wifi',
+  usbDevice: '',
 };
 
 const cfg = { ...DEFAULTS, ...readCfg() };
@@ -51,6 +53,7 @@ const el = {
   overlay: $('overlay'),
   overlayText: $('overlayText'),
   mjpeg: $('mjpeg'),
+  usb: $('usb'),
   canvas: $('canvas'),
   modeBadge: $('modeBadge'),
   recDot: $('recDot'),
@@ -177,8 +180,10 @@ window.addEventListener('pagehide', releaseLease);
 /* ------------------------------------------------------------------ */
 
 const state = {
-  mode: null,          // 'mjpeg' | 'poll' | null
+  mode: null,          // 'mjpeg' | 'poll' | 'usb' | null
+  source: 'wifi',      // 'wifi' | 'usb'
   streamUrl: null,
+  usbStream: null,
   running: false,
   pollTimer: null,
   rafId: null,
@@ -198,6 +203,11 @@ const state = {
 
 async function connect() {
   disconnect();
+  state.source = cfg.source === 'usb' ? 'usb' : 'wifi';
+  document.body.classList.toggle('usb', state.source === 'usb');
+
+  if (state.source === 'usb') return connectUsb();
+
   setDot('connecting', `${cfg.host}:${cfg.port}`);
 
   // A page served over HTTPS cannot reach an http:// camera on a private
@@ -258,6 +268,11 @@ function disconnect() {
   state.streamAbort = null;
   if (state.rafId) cancelAnimationFrame(state.rafId);
   state.rafId = null;
+  if (state.usbStream) {
+    state.usbStream.getTracks().forEach((t) => t.stop());
+    state.usbStream = null;
+  }
+  el.usb.srcObject = null;
   if (state.recorder && state.recorder.state !== 'inactive') state.recorder.stop();
   state.recorder = null;
   state.recording = null;
@@ -268,10 +283,163 @@ function disconnect() {
   ctx.clearRect(0, 0, el.canvas.width, el.canvas.height);
   state.mode = null;
   state.streamUrl = null;
+  state.gotFrame = false;
   state.fpsAvg = 0;
   state.lastFrameAt = 0;
   el.fps.textContent = '0';
   el.latency.textContent = '–';
+}
+
+/* ------------------------------------------------------------------ */
+/* USB (UVC webcam) path                                               */
+/* ------------------------------------------------------------------ */
+
+// Plugged in over USB this camera is an ordinary UVC webcam, so the browser's
+// own camera API reads it — full frame rate, no HTTP, no firmware quirks.
+
+function usbSupported() {
+  return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+}
+
+async function listUsbCameras(askPermission = false) {
+  if (!usbSupported()) return [];
+  const onlyVideo = (list) => list.filter((d) => d.kind === 'videoinput');
+  let devs = onlyVideo(await navigator.mediaDevices.enumerateDevices());
+
+  // Labels stay empty until the user has granted camera access once.
+  if (askPermission && devs.length && devs.every((d) => !d.label)) {
+    try {
+      const probe = await navigator.mediaDevices.getUserMedia({ video: true });
+      probe.getTracks().forEach((t) => t.stop());
+      devs = onlyVideo(await navigator.mediaDevices.enumerateDevices());
+    } catch (err) {
+      log(`Camera permission: ${err.name}`, 'error');
+    }
+  }
+  return devs;
+}
+
+function fillUsbChoices(select, devs, current) {
+  const rows = ['<option value="">Default camera</option>'];
+  devs.forEach((d, i) => {
+    const label = d.label || `Camera ${i + 1}`;
+    rows.push(`<option value="${escapeHtml(d.deviceId)}">${escapeHtml(label)}</option>`);
+  });
+  select.innerHTML = rows.join('');
+  if (current && [...select.options].some((o) => o.value === current)) select.value = current;
+}
+
+async function connectUsb() {
+  if (!usbSupported()) {
+    showOverlay(
+      'This browser will not let the page open the USB camera. Serve the page from ' +
+      'http://localhost:8000 (Chrome or Firefox); camera access is refused on file:// and on plain http:// addresses.',
+      true,
+    );
+    setDot('offline');
+    log('getUserMedia unavailable: camera access needs https:// or http://localhost.', 'error');
+    return false;
+  }
+
+  showOverlay('Opening USB camera…');
+  setDot('connecting', 'USB');
+
+  const video = el.usb;
+  const constraints = {
+    audio: false,
+    video: cfg.usbDevice
+      ? { deviceId: { exact: cfg.usbDevice } }
+      : { width: { ideal: 1280 }, height: { ideal: 720 } },
+  };
+
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia(constraints);
+  } catch (err) {
+    const msg = {
+      NotAllowedError: 'Camera permission was denied. Allow it for this site, then press Reconnect.',
+      NotFoundError: 'No camera found. Plug the camera in by USB, then press Reconnect.',
+      NotReadableError: 'The camera could not be opened. This is usually a bad cable or port — try another port directly on the computer.',
+      OverconstrainedError: 'That camera is no longer connected. Pick another one in Settings.',
+      SecurityError: 'Camera access needs https:// or http://localhost.',
+      AbortError: 'The camera was disconnected while opening it.',
+    }[err.name] || `Could not open the camera: ${err.message}`;
+    showOverlay(msg, true);
+    setDot('offline');
+    log(`getUserMedia → ${err.name}: ${err.message}`, 'error');
+    return false;
+  }
+
+  state.usbStream = stream;
+  const track = stream.getVideoTracks()[0];
+  const settings = track.getSettings ? track.getSettings() : {};
+
+  video.srcObject = stream;
+  try { await video.play(); } catch { /* autoplay is muted, so this rarely fails */ }
+
+  const label = track.label || 'USB camera';
+  state.mode = 'usb';
+  state.running = true;
+  state.failCount = 0;
+  state.gotFrame = false;
+  el.canvas.hidden = false;
+  el.mjpeg.hidden = true;
+  el.modeBadge.hidden = false;
+  el.modeBadge.classList.remove('stalled');
+  el.modeBadge.textContent = 'USB';
+  setDot('online', label.replace(/^.*?:\s*/, '') || 'USB camera');
+  log(`USB camera: ${label}` +
+      (settings.width ? ` — ${settings.width}×${settings.height}` : '') +
+      (settings.frameRate ? ` @ ${Math.round(settings.frameRate)} fps` : ''));
+
+  track.addEventListener('ended', () => {
+    if (state.mode !== 'usb') return;
+    state.running = false;
+    setDot('offline');
+    showOverlay('The camera was disconnected. Plug it back in and press Reconnect.', true);
+    log('USB camera disconnected.', 'error');
+  });
+
+  el.usb.hidden = true;
+  startUsbPaint(video);
+  return true;
+}
+
+function startUsbPaint(video) {
+  const ctx = el.canvas.getContext('2d', { alpha: false });
+
+  const paint = () => {
+    if (!state.running || state.mode !== 'usb') return;
+    if (video.readyState >= 2 && video.videoWidth) {
+      if (el.canvas.width !== video.videoWidth || el.canvas.height !== video.videoHeight) {
+        el.canvas.width = video.videoWidth;
+        el.canvas.height = video.videoHeight;
+      }
+      ctx.drawImage(video, 0, 0);
+      el.resStat.textContent = `${video.videoWidth}×${video.videoHeight}`;
+      $('frameSize').textContent = `${video.videoWidth}×${video.videoHeight}`;
+      if (!state.gotFrame) {
+        state.gotFrame = true;
+        hideOverlay();
+      }
+    }
+    state.rafId = requestAnimationFrame(paint);
+  };
+  state.rafId = requestAnimationFrame(paint);
+
+  // Count real frames for the fps readout, not screen repaints.
+  if (video.requestVideoFrameCallback) {
+    const tick = () => {
+      if (!state.running || state.mode !== 'usb') return;
+      noteFrame();
+      video.requestVideoFrameCallback(tick);
+    };
+    video.requestVideoFrameCallback(tick);
+  } else {
+    const iv = setInterval(() => {
+      if (state.running && state.mode === 'usb') noteFrame(); else clearInterval(iv);
+    }, 33);
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -428,6 +596,7 @@ function startMjpegStream(url) {
       ctx.drawImage(bmp, 0, 0);
       bmp.close?.();
       hideOverlay();
+      state.gotFrame = true;
       noteFrame();
     } catch (err) {
       log(`frame decode failed: ${err.message}`, 'error');
@@ -716,9 +885,23 @@ function wireImageControls() {
 /* snapshot / record / fullscreen                                      */
 /* ------------------------------------------------------------------ */
 
+function canvasBlob() {
+  return new Promise((resolve) => el.canvas.toBlob(resolve, 'image/jpeg', 0.92));
+}
+
 function wireStageButtons() {
   $('btnSnap').addEventListener('click', async () => {
     try {
+      // Take the frame that is already on screen. For the Wi-Fi camera this
+      // avoids a second /snapshot.cgi request, which can wedge the capture
+      // engine; for USB it is the only sensible source.
+      if (state.gotFrame) {
+        const blob = await canvasBlob();
+        if (!blob || blob.size < 1024) throw new Error('nothing on screen yet');
+        downloadBlob(blob, `ypc-${stamp()}.jpg`);
+        log('Snapshot saved.');
+        return;
+      }
       const res = await fetch(buildUrl('/snapshot.cgi'), { cache: 'no-store' });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const blob = await res.blob();
@@ -745,7 +928,16 @@ function wireStageButtons() {
 
 function startRecording() {
   if (!state.canRecord) return;
-  if (!el.canvas.captureStream || typeof MediaRecorder === 'undefined') {
+
+  // USB: record the camera stream itself, at its native rate and size.
+  // Wi-Fi: record the canvas the frames are painted into.
+  const fromUsb = state.mode === 'usb' && state.usbStream;
+  const stream = fromUsb ? state.usbStream : el.canvas.captureStream?.(20);
+  if (!stream) {
+    log('Recording is not supported by this browser.', 'error');
+    return;
+  }
+  if (typeof MediaRecorder === 'undefined') {
     log('Recording is not supported by this browser.', 'error');
     return;
   }
@@ -753,7 +945,6 @@ function startRecording() {
     .find((m) => MediaRecorder.isTypeSupported(m));
   if (!mime) { log('No usable video encoder in this browser.', 'error'); return; }
 
-  const stream = el.canvas.captureStream(20);
   const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 2_000_000 });
   state.chunks = [];
   rec.ondataavailable = (e) => { if (e.data.size) state.chunks.push(e.data); };
@@ -803,16 +994,31 @@ function openSettings() {
   $('cfgPort').value = cfg.port;
   $('cfgUser').value = cfg.user;
   $('cfgPwd').value = cfg.pwd;
+  $('cfgSource').value = cfg.source;
+  syncSourceFields();
+  listUsbCameras(false).then((devs) => fillUsbChoices($('cfgUsbDevice'), devs, cfg.usbDevice));
   el.settingsDlg.showModal();
+}
+
+function syncSourceFields() {
+  const usb = $('cfgSource').value === 'usb';
+  $('usbFields').hidden = !usb;
+  $('wifiFields').hidden = usb;
+  if (usb && !usbSupported()) {
+    $('usbHint').textContent = 'This browser blocks camera access on this address. Open the page from http://localhost:8000 instead.';
+  }
 }
 
 function wireSettings() {
   $('btnSettings').addEventListener('click', openSettings);
+  $('cfgSource').addEventListener('change', syncSourceFields);
 
   $('settingsForm').addEventListener('submit', (e) => {
     const action = e.submitter?.value;
     if (action === 'cancel') return;
     e.preventDefault();
+    cfg.source = $('cfgSource').value === 'usb' ? 'usb' : 'wifi';
+    cfg.usbDevice = $('cfgUsbDevice').value || '';
     cfg.host = $('cfgHost').value.trim() || DEFAULTS.host;
     cfg.port = $('cfgPort').value.trim() || DEFAULTS.port;
     cfg.user = $('cfgUser').value.trim() || DEFAULTS.user;
@@ -823,6 +1029,20 @@ function wireSettings() {
   });
 
   $('btnReconnect').addEventListener('click', connect);
+
+  // USB device pickers in the side panel.
+  const pick = async (ask) => {
+    const devs = await listUsbCameras(ask);
+    fillUsbChoices($('usbDevice'), devs, cfg.usbDevice);
+    fillUsbChoices($('cfgUsbDevice'), devs, cfg.usbDevice);
+    log(`Found ${devs.length} camera${devs.length === 1 ? '' : 's'}.`);
+  };
+  $('btnRescan').addEventListener('click', () => pick(true));
+  $('usbDevice').addEventListener('change', (e) => {
+    cfg.usbDevice = e.target.value;
+    saveCfg();
+    connect();
+  });
 
   document.querySelectorAll('.tab').forEach((tab) => {
     tab.addEventListener('click', () => {
@@ -898,12 +1118,13 @@ function escapeHtml(s) {
   wireStageButtons();
   wireInstall();
 
-  // URL overrides: ?host=…&port=…&user=…&pwd=…
+  // URL overrides: ?host=…&port=…&user=…&pwd=…&source=usb
   const q = new URLSearchParams(location.search);
   let changed = false;
-  for (const k of ['host', 'port', 'user', 'pwd']) {
+  for (const k of ['host', 'port', 'user', 'pwd', 'usbDevice']) {
     if (q.has(k)) { cfg[k] = q.get(k); changed = true; }
   }
+  if (q.get('source') === 'usb') { cfg.source = 'usb'; changed = true; }
   if (changed) saveCfg();
 
   const hasSaved = !!localStorage.getItem('ypc.cfg');

@@ -5,7 +5,7 @@
  * alone: a service worker cannot and must not intercept it.
  */
 
-const CACHE = 'ypc-shell-v1';
+const CACHE = 'ypc-shell-v2';
 const ASSETS = [
   './',
   './index.html',
