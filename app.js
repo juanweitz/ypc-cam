@@ -27,6 +27,7 @@ const DEFAULTS = {
   pwd: '',
   source: 'wifi',
   usbDevice: '',
+  usbSize: '1280x720',
 };
 
 const cfg = { ...DEFAULTS, ...readCfg() };
@@ -306,6 +307,18 @@ function usbSupported() {
   return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
 }
 
+/** Camera constraints, including the requested frame size. */
+function usbConstraints(deviceId) {
+  const video = {};
+  if (deviceId) video.deviceId = { exact: deviceId };
+  const [w, h] = (cfg.usbSize || '1280x720').split('x').map(Number);
+  if (w && h) {
+    video.width = { ideal: w };
+    video.height = { ideal: h };
+  }
+  return { audio: false, video };
+}
+
 async function listUsbCameras(askPermission = false) {
   if (!usbSupported()) return [];
   const onlyVideo = (list) => list.filter((d) => d.kind === 'videoinput');
@@ -359,14 +372,11 @@ async function connectUsb() {
 
   showOverlay('Opening USB camera…');
   setDot('connecting', 'USB');
+  $('usbSize').value = cfg.usbSize || '1280x720';
+  $('usbDevice').value = cfg.usbDevice || '';
 
   const video = el.usb;
-  const constraints = {
-    audio: false,
-    video: cfg.usbDevice
-      ? { deviceId: { exact: cfg.usbDevice } }
-      : { width: { ideal: 1280 }, height: { ideal: 720 } },
-  };
+  const constraints = usbConstraints(cfg.usbDevice);
 
   let stream;
   try {
@@ -394,10 +404,7 @@ async function connectUsb() {
       const want = devs.find((d) => d.kind === 'videoinput' && /usb 2\.0 camera|lihappe|ypc/i.test(d.label));
       const current = stream.getVideoTracks()[0]?.getSettings?.().deviceId;
       if (want && want.deviceId && want.deviceId !== current) {
-        const better = await navigator.mediaDevices.getUserMedia({
-          audio: false,
-          video: { deviceId: { exact: want.deviceId } },
-        });
+        const better = await navigator.mediaDevices.getUserMedia(usbConstraints(want.deviceId));
         stream.getTracks().forEach((t) => t.stop());
         stream = better;
         cfg.usbDevice = want.deviceId;
@@ -1083,6 +1090,11 @@ function wireSettings() {
   $('btnRescan').addEventListener('click', () => pick(true));
   $('usbDevice').addEventListener('change', (e) => {
     cfg.usbDevice = e.target.value;
+    saveCfg();
+    connect();
+  });
+  $('usbSize').addEventListener('change', (e) => {
+    cfg.usbSize = e.target.value;
     saveCfg();
     connect();
   });

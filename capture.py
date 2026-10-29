@@ -110,6 +110,26 @@ def cmd_list(_args) -> int:
     return 0
 
 
+def source_chain(node: str, fmt: str, size: str | None, buffers: int | None = None) -> str:
+    """The v4l2src element plus the caps we want it to negotiate.
+
+    MJPEG is the default: this camera offers uncompressed YUYV up to
+    1280x960@30, which is ~74 MB/s — more than USB 2.0 can carry. Compressed
+    frames move a tenth of the data for the same picture.
+    """
+    elem = f"v4l2src device={node}"
+    if buffers:
+        elem += f" num-buffers={buffers}"
+    caps = []
+    if size:
+        w, h = size.lower().split("x")
+        caps.append(f"width={w},height={h}")
+    capstr = ("," + ",".join(caps)) if caps else ""
+    if fmt == "mjpeg":
+        return f"{elem} ! image/jpeg{capstr} ! jpegdec"
+    return f"{elem} ! video/x-raw{capstr}"
+
+
 def gst(pipeline: str) -> int:
     """Run a gst-launch pipeline, streaming its errors instead of hiding them."""
     cmd = ["gst-launch-1.0", "-e", "-q"] + pipeline.split()
@@ -124,37 +144,38 @@ def gst(pipeline: str) -> int:
 def cmd_snap(args) -> int:
     node = find_device(args.device, args.name)
     out = Path(args.out or f"ypc-{stamp()}.jpg")
-    # Let auto-exposure settle for a moment, then keep overwriting the file so
-    # the last (settled) frame is the one that survives.
-    pipeline = (
-        f"v4l2src device={node} num-buffers={args.settle} ! "
-        f"videoconvert ! jpegenc quality={args.quality} ! "
-        f"multifilesink location={out}"
-    )
-    rc = gst(pipeline)
-    if rc == 0 and out.exists() and out.stat().st_size > 1024:
-        print(f"Saved {out} ({out.stat().st_size / 1024:.0f} KB)")
-        return 0
+
+    def pipeline(fmt: str) -> str:
+        # Keep overwriting one file so the last, exposure-settled frame survives.
+        return (
+            f"{source_chain(node, fmt, args.size, buffers=args.settle)} ! "
+            f"videoconvert ! jpegenc quality={args.quality} ! "
+            f"multifilesink location={out}"
+        )
+
+    fmts = [args.format] if args.format != "auto" else ["mjpeg", "raw"]
+    for fmt in fmts:
+        if gst(pipeline(fmt)) == 0 and out.exists() and out.stat().st_size > 1024:
+            print(f"Saved {out} ({out.stat().st_size / 1024:.0f} KB, {fmt})")
+            return 0
+        print(f"({fmt} capture failed, trying next)", file=sys.stderr)
     print("Capture failed — no frame was produced.", file=sys.stderr)
-    return rc or 1
+    return 1
 
 
 def cmd_record(args) -> int:
     node = find_device(args.device, args.name)
     out = Path(args.out or f"ypc-{stamp()}.mp4")
 
-    caps = "video/x-raw,format=I420"
-    if args.size:
-        w, h = args.size.lower().split("x")
-        caps += f",width={w},height={h}"
+    def pipeline(fmt: str) -> str:
+        return (
+            f"{source_chain(node, fmt, args.size)} ! videoconvert ! "
+            f"video/x-raw,format=I420 ! "
+            f"x264enc tune=zerolatency speed-preset=veryfast bitrate={args.bitrate} "
+            f"key-int-max=30 ! h264parse ! mp4mux ! filesink location={out}"
+        )
 
-    pipeline = (
-        f"v4l2src device={node} ! videoconvert ! "
-        f"{caps} ! "
-        f"x264enc tune=zerolatency speed-preset=veryfast bitrate={args.bitrate} "
-        f"key-int-max=30 ! h264parse ! mp4mux ! filesink location={out}"
-    )
-
+    fmts = [args.format] if args.format != "auto" else ["mjpeg", "raw"]
     if args.seconds:
         print(f"Recording {args.seconds}s to {out} … (Ctrl-C stops early)")
 
@@ -167,10 +188,12 @@ def cmd_record(args) -> int:
     else:
         print(f"Recording to {out} … press Ctrl-C to stop.")
 
-    rc = gst(pipeline)
-    if out.exists() and out.stat().st_size > 1024:
-        print(f"Saved {out} ({out.stat().st_size / 1024 / 1024:.1f} MB)")
-        return 0
+    for fmt in fmts:
+        rc = gst(pipeline(fmt))
+        if out.exists() and out.stat().st_size > 1024:
+            print(f"Saved {out} ({out.stat().st_size / 1024 / 1024:.1f} MB, {fmt})")
+            return 0
+        print(f"({fmt} recording failed, trying next)", file=sys.stderr)
     print("No video was written.", file=sys.stderr)
     return rc or 1
 
@@ -235,6 +258,9 @@ def main() -> int:
     p.add_argument("-o", "--out")
     p.add_argument("--quality", type=int, default=90)
     p.add_argument("--settle", type=int, default=25, help="frames to discard while exposure settles")
+    p.add_argument("--size", help="WxH, e.g. 1280x720 (default: camera native)")
+    p.add_argument("--format", choices=["auto", "mjpeg", "raw"], default="auto",
+                   help="pixel format; auto tries MJPEG first")
     p.set_defaults(func=cmd_snap)
 
     p = sub.add_parser("record", help="record video (Ctrl-C to stop)")
@@ -242,6 +268,8 @@ def main() -> int:
     p.add_argument("--seconds", type=float, help="stop after this many seconds")
     p.add_argument("--size", help="WxH, e.g. 1280x720 (default: camera native)")
     p.add_argument("--bitrate", type=int, default=4000, help="kbit/s")
+    p.add_argument("--format", choices=["auto", "mjpeg", "raw"], default="auto",
+                   help="pixel format; auto tries MJPEG first")
     p.set_defaults(func=cmd_record)
 
     p = sub.add_parser("preview", help="live window")

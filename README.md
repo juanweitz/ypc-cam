@@ -74,10 +74,19 @@ Plugged in over USB the camera presents itself as a standard UVC webcam
 (`038f:6001`, "USB 2.0 Camera" by lihappe8 Corp.), so Linux drives it with
 `uvcvideo` and nothing proprietary is involved.
 
-**In the page:** Settings → Source → *USB camera* → Connect. The video is drawn
-to the same canvas as the Wi-Fi path, so Snapshot, Record and Fullscreen work
-unchanged. Recording uses the camera stream directly, at native resolution and
-frame rate.
+Two quirks of this device are worth knowing:
+
+* **It defaults to uncompressed video.** YUYV at 1280×960 and a claimed 30 fps
+  is ~74 MB/s, more than a USB 2.0 port can carry. `capture.py` asks for MJPEG
+  instead (about a tenth of the data for the same picture), and falls back to
+  raw if a camera has no JPEG mode.
+* **It really runs at about 8 fps**, whatever mode or resolution you ask for —
+  the 30 fps in its descriptors is not true.
+
+**In the page:** Settings → Source → *USB camera* → Connect. Frame size is
+selectable (640×480, 1280×720, 1280×960). The video is drawn to the same canvas
+as the Wi-Fi path, so Snapshot, Record and Fullscreen work unchanged; recording
+uses the camera stream directly.
 
 **From the command line:** `capture.py` drives GStreamer, so there is nothing to
 install if `gst-launch-1.0` is present.
@@ -93,11 +102,10 @@ install if `gst-launch-1.0` is present.
 
 Files are written next to the script as `ypc-<date>-<time>.jpg` / `.mp4`;
 use `-o` to choose a name, or `--device /dev/video2` / `--name "USB 2.0
-Camera"` to pick the device.
+Camera"` to pick the device. `--format raw` forces uncompressed video.
 
 USB is the better path when the Wi-Fi module misbehaves: no access point to
-join, no snapshot engine to overflow, and a real 30 fps stream instead of
-polled JPEGs.
+join, no snapshot engine to overflow, and no polling.
 
 ## How it works
 
@@ -172,10 +180,14 @@ lets one tab hold the camera, but a phone app or a second device can still
 trigger it.
 
 **USB: "Cannot enable. Maybe the USB cable is bad?"** The kernel sees the camera
-announce itself and then fails to bring it up. That is the cable or the port, not
-the software: use a cable that carries data (many micro-USB cables are
-charge-only) and plug straight into the machine rather than a hub. Check with
-`./capture.py diagnose`.
+announce itself and then fails to bring it up. Two causes, both worth fixing:
+
+* *Not enough power or bus bandwidth.* Other USB devices on the same controller
+  were enough to make this camera drop out. Unplug hubs, docks and network
+  adapters while using it — that is what made it stable here.
+* *The cable.* Use one that carries data; many micro-USB cables are charge-only.
+
+Check with `./capture.py diagnose`.
 
 **USB: nothing happens / permission denied.** The page must be opened from
 `http://localhost:8000`; browsers refuse camera access on `file://` and over
