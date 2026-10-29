@@ -1,7 +1,7 @@
 {
   "name": "YPC Camera",
   "short_name": "YPC Cam",
-  "description": "Local viewer and controls for the YPC99 Wi-Fi camera",
+  "description": "USB viewer and recorder for the YPC99 camera",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",

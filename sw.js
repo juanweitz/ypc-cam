@@ -11,7 +11,7 @@
  * installed app still opens while the server is stopped.
  */
 
-const CACHE = 'ypc-shell-v2';
+const CACHE = 'ypc-shell-v3';
 const ASSETS = [
   './',
   './index.html',
