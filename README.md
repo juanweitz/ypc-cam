@@ -23,24 +23,6 @@ python3 -m http.server 8000
 
 Then visit <http://localhost:8000>.
 
-### Standalone single file
-
-If you don't want to run a server at all, build the self-contained version:
-
-```bash
-python3 build.py      # writes ypc-cam.html
-```
-
-`ypc-cam.html` has the CSS and JavaScript inlined (no external requests at
-all) and works when opened directly from disk — just double-click it. It does
-not depend on GitHub, a server, or an internet connection.
-
-You can pass the camera address in the URL if you don't want to type it:
-
-```
-file:///path/to/ypc-cam.html?host=192.168.1.1&port=36299&user=admin&pwd=
-```
-
 On first load you get a connection dialog. Defaults are already correct for
 this camera:
 
@@ -129,8 +111,21 @@ trigger it.
 
 ## GitHub Pages
 
-`https://juanweitz.github.io/ypc-cam/` serves this UI, but it cannot talk to the
-camera: Pages is HTTPS and the camera only speaks HTTP on a private address, so
-the browser blocks every request (mixed content + Private Network Access). Use
-the local server or the standalone file instead.
+`https://juanweitz.github.io/ypc-cam/` serves this UI, but the browser blocks its
+requests to the camera. Chrome logs:
+
+```
+Mixed Content: ... insecure resource 'http://192.168.1.1:36299/...'
+Access to fetch ... blocked by CORS policy:
+Permission was denied for this request to access the `local` address space.
+```
+
+Two rules are involved: Pages is HTTPS while the camera is HTTP (mixed content),
+and a public page may not reach a private address without the server opting in
+(Private Network Access) — which Boa cannot do.
+
+Workaround for Chrome desktop: open
+`chrome://flags/#unsafely-treat-insecure-origin-as-secure`, add
+`http://192.168.1.1:36299`, enable it and restart Chrome. The hosted page then
+works; this is a per-browser setting, not something the site can control.
 
