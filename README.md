@@ -123,23 +123,14 @@ poll snapshots at the same time — the page now pauses background tabs and only
 lets one tab hold the camera, but a phone app or a second device can still
 trigger it.
 
-## GitHub Pages
+## Hosting
 
-`https://juanweitz.github.io/ypc-cam/` serves this UI, but the browser blocks its
-requests to the camera. Chrome logs:
+The UI has to be served over plain HTTP on your own machine, because the camera
+itself only speaks HTTP on a private address. Do not host it over HTTPS (GitHub
+Pages, Netlify, etc.): the browser blocks every request to the camera as mixed
+content and Private Network Access then rejects the local address.
 
-```
-Mixed Content: ... insecure resource 'http://192.168.1.1:36299/...'
-Access to fetch ... blocked by CORS policy:
-Permission was denied for this request to access the `local` address space.
-```
-
-Two rules are involved: Pages is HTTPS while the camera is HTTP (mixed content),
-and a public page may not reach a private address without the server opting in
-(Private Network Access) — which Boa cannot do.
-
-Workaround for Chrome desktop: open
+If your browser ever reports that block, open
 `chrome://flags/#unsafely-treat-insecure-origin-as-secure`, add
-`http://192.168.1.1:36299`, enable it and restart Chrome. The hosted page then
-works; this is a per-browser setting, not something the site can control.
+`http://192.168.1.1:36299`, enable it and restart Chrome.
 
