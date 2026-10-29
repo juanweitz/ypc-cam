@@ -113,6 +113,15 @@ browser's site settings, then press Reconnect.
 
 ## Hosting
 
-Serve it from `http://localhost` (or another secure origin). Do not host it from
-a plain `http://` address on the network, and do not bother with a static host:
-`getUserMedia` is only available in a secure context.
+The page runs from any HTTPS static host. The original Wi-Fi version could not
+be hosted: it had to `fetch()` a private `http://192.168.1.1:36299` address,
+which browsers block from an HTTPS page (mixed content, Private Network Access).
+This version has no such requests — the camera is opened by the browser itself,
+so the page's origin is irrelevant as long as it is a secure context.
+
+`https://juanweitz.github.io/ypc-cam/` is live and is built from `main`;
+pushing to `main` redeploys it. Camera permission is per origin, so granting it
+to the Pages URL is separate from granting it to `http://localhost:8000`.
+
+Serving it from plain `http://` on your LAN will not work: `getUserMedia`
+requires a secure context (`https://` or `localhost`).
