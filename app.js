@@ -199,6 +199,21 @@ const state = {
 async function connect() {
   disconnect();
   setDot('connecting', `${cfg.host}:${cfg.port}`);
+
+  // A page served over HTTPS cannot reach an http:// camera on a private
+  // address: mixed content plus Private Network Access both block it.
+  if (location.protocol === 'https:' && !/^(localhost|127\.0\.0\.1|\[::1\])$/i.test(cfg.host)) {
+    showOverlay(
+      'This page is loaded over HTTPS, so the browser blocks requests to the camera at ' +
+      `${base()}. Open the page over http://localhost:8000 instead, or allow this origin via ` +
+      'chrome://flags/#unsafely-treat-insecure-origin-as-secure.',
+      true,
+    );
+    setDot('offline');
+    log('Blocked: HTTPS page cannot call the HTTP camera (mixed content / Private Network Access).', 'error');
+    return false;
+  }
+
   showOverlay('Connecting…');
   log(`Connecting to ${base()} as "${cfg.user}"`);
 
