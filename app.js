@@ -184,6 +184,7 @@ const state = {
   source: 'wifi',      // 'wifi' | 'usb'
   streamUrl: null,
   usbStream: null,
+  gen: 0,
   running: false,
   pollTimer: null,
   rafId: null,
@@ -206,7 +207,10 @@ async function connect() {
   state.source = cfg.source === 'usb' ? 'usb' : 'wifi';
   document.body.classList.toggle('usb', state.source === 'usb');
 
-  if (state.source === 'usb') return connectUsb();
+  if (state.source === 'usb') {
+    keepVisibleTab();
+    return connectUsb();
+  }
 
   setDot('connecting', `${cfg.host}:${cfg.port}`);
 
@@ -261,6 +265,7 @@ async function connect() {
 
 function disconnect() {
   state.running = false;
+  state.gen += 1;          // stops any capture loop from an older connection
   releaseLease();
   clearTimeout(state.pollTimer);
   state.pollTimer = null;
@@ -327,6 +332,17 @@ function fillUsbChoices(select, devs, current) {
   });
   select.innerHTML = rows.join('');
   if (current && [...select.options].some((o) => o.value === current)) select.value = current;
+}
+
+function selectTab(name) {
+  document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t.dataset.tab === name));
+  document.querySelectorAll('.tabpane').forEach((p) => p.classList.toggle('active', p.id === `pane-${name}`));
+}
+
+/** The Wi-Fi-only panels disappear in USB mode; make sure a visible tab is open. */
+function keepVisibleTab() {
+  const active = document.querySelector('.tab.active');
+  if (!active || active.offsetParent === null) selectTab('camera');
 }
 
 async function connectUsb() {
@@ -397,6 +413,8 @@ async function connectUsb() {
   state.usbStream = stream;
   const track = stream.getVideoTracks()[0];
   const settings = track.getSettings ? track.getSettings() : {};
+  // Each connection gets a generation number; loops from an older one stop.
+  const gen = state.gen;
 
   video.srcObject = stream;
   try { await video.play(); } catch { /* autoplay is muted, so this rarely fails */ }
@@ -417,7 +435,7 @@ async function connectUsb() {
       (settings.frameRate ? ` @ ${Math.round(settings.frameRate)} fps` : ''));
 
   track.addEventListener('ended', () => {
-    if (state.mode !== 'usb') return;
+    if (state.mode !== 'usb' || gen !== state.gen) return;
     state.running = false;
     setDot('offline');
     showOverlay('The camera was disconnected. Plug it back in and press Reconnect.', true);
@@ -425,15 +443,16 @@ async function connectUsb() {
   });
 
   el.usb.hidden = true;
-  startUsbPaint(video);
+  startUsbPaint(video, gen);
   return true;
 }
 
-function startUsbPaint(video) {
+function startUsbPaint(video, gen) {
   const ctx = el.canvas.getContext('2d', { alpha: false });
+  const alive = () => state.running && state.mode === 'usb' && gen === state.gen;
 
   const paint = () => {
-    if (!state.running || state.mode !== 'usb') return;
+    if (!alive()) return;
     if (video.readyState >= 2 && video.videoWidth) {
       if (el.canvas.width !== video.videoWidth || el.canvas.height !== video.videoHeight) {
         el.canvas.width = video.videoWidth;
@@ -454,14 +473,14 @@ function startUsbPaint(video) {
   // Count real frames for the fps readout, not screen repaints.
   if (video.requestVideoFrameCallback) {
     const tick = () => {
-      if (!state.running || state.mode !== 'usb') return;
+      if (!alive()) return;
       noteFrame();
       video.requestVideoFrameCallback(tick);
     };
     video.requestVideoFrameCallback(tick);
   } else {
     const iv = setInterval(() => {
-      if (state.running && state.mode === 'usb') noteFrame(); else clearInterval(iv);
+      if (alive()) noteFrame(); else clearInterval(iv);
     }, 33);
   }
 }

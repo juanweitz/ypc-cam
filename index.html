@@ -55,8 +55,8 @@
   <aside class="panel">
     <nav class="tabs">
       <button class="tab active" data-tab="camera">Camera</button>
-      <button class="tab" data-tab="config">Config</button>
-      <button class="tab" data-tab="debug">Debug</button>
+      <button class="tab" data-tab="config" data-wifi-only>Config</button>
+      <button class="tab" data-tab="debug" data-wifi-only>Debug</button>
     </nav>
 
     <div class="tabpane active" id="pane-camera">
@@ -141,7 +141,7 @@
       </div>
     </div>
 
-    <div class="tabpane" id="pane-config">
+    <div class="tabpane" id="pane-config" data-wifi-only>
       <div class="group">
         <h2>Device status</h2>
         <dl class="kv" id="statusList"><dt>—</dt><dd></dd></dl>
@@ -153,7 +153,7 @@
       </div>
     </div>
 
-    <div class="tabpane" id="pane-debug">
+    <div class="tabpane" id="pane-debug" data-wifi-only>
       <div class="group">
         <h2>Request</h2>
         <div class="inline">

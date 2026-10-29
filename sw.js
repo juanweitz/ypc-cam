@@ -3,6 +3,12 @@
  * Only same-origin GET requests are handled. Camera traffic goes to
  * http://192.168.1.1:36299 (a different origin) and is deliberately left
  * alone: a service worker cannot and must not intercept it.
+ *
+ * Strategy: network first, cache as the fallback. The UI is served from
+ * localhost, which is always up when the page is in use, so freshness matters
+ * more than speed here — and a stale app.js paired with a new index.html is
+ * exactly the kind of mismatch that breaks the page. The cache exists so the
+ * installed app still opens while the server is stopped.
  */
 
 const CACHE = 'ypc-shell-v2';
@@ -41,23 +47,15 @@ self.addEventListener('fetch', (event) => {
   if (url.origin !== self.location.origin) return;   // camera requests pass through
 
   event.respondWith(
-    caches.match(req, { ignoreSearch: true }).then((hit) => {
-      if (hit) {
-        // Refresh in the background so updates land on the next launch.
-        fetch(req).then((res) => {
-          if (res.ok) caches.open(CACHE).then((c) => c.put(req, res.clone()));
-        }).catch(() => {});
-        return hit;
-      }
-      return fetch(req)
-        .then((res) => {
-          if (res.ok) {
-            const copy = res.clone();
-            caches.open(CACHE).then((c) => c.put(req, copy));
-          }
-          return res;
-        })
-        .catch(() => caches.match('./index.html'));
-    }),
+    fetch(req)
+      .then((res) => {
+        if (res.ok) {
+          const copy = res.clone();
+          caches.open(CACHE).then((c) => c.put(req, copy)).catch(() => {});
+        }
+        return res;
+      })
+      .catch(() => caches.match(req, { ignoreSearch: true })
+        .then((hit) => hit || caches.match('./index.html'))),
   );
 });
