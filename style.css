@@ -230,6 +230,13 @@ code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-si
 .row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
 .row > span { flex: 0 0 84px; color: var(--muted); font-size: 13px; }
 .row output { flex: 0 0 34px; text-align: right; font-variant-numeric: tabular-nums; font-size: 12px; color: var(--muted); }
+.row.toggle input[type="checkbox"] {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
 
 input[type="text"], input[type="password"], input[type="number"], select {
   flex: 1;

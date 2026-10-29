@@ -72,8 +72,8 @@
         </label>
         <label class="row">
           <span>Contrast</span>
-          <input type="range" id="contrast" min="0" max="6" value="3">
-          <output id="contrastVal">3</output>
+          <input type="range" id="contrast" min="0" max="255" value="8">
+          <output id="contrastVal">8</output>
         </label>
         <label class="row">
           <span>Orientation</span>
@@ -104,15 +104,7 @@
             <option value="6">Fast — 6 fps</option>
           </select>
         </label>
-        <label class="row">
-          <span>Frame size</span>
-          <select id="resolution">
-            <option value="15">640×480 (fast)</option>
-            <option value="21">1280×960 (sharp)</option>
-          </select>
-        </label>
-        <p class="hint">Frame size is stored on the camera and takes a few seconds to apply.</p>
-        <button class="btn wide" id="btnApplyStream">Apply &amp; restart stream</button>
+        <p class="hint">Frame size reported by the camera: <strong id="frameSize">—</strong></p>
       </div>
 
       <div class="group">
@@ -122,6 +114,10 @@
           <input type="text" id="alias" maxlength="20" placeholder="Camera name">
         </label>
         <button class="btn wide" id="btnAlias">Save name</button>
+        <label class="row toggle">
+          <span>Status LED</span>
+          <input type="checkbox" id="led" checked>
+        </label>
         <button class="btn wide danger" id="btnReboot">Reboot camera</button>
       </div>
     </div>

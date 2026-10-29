@@ -144,6 +144,35 @@ function parseVars(text) {
 }
 
 /* ------------------------------------------------------------------ */
+/* single-viewer guard                                                 */
+/* ------------------------------------------------------------------ */
+
+// This camera can only sustain one snapshot client. Tabs coordinate through
+// localStorage: only the tab holding a fresh lease may poll.
+const TAB_ID = Math.random().toString(36).slice(2);
+const LEASE = 'ypc.viewer';
+
+function readLease() {
+  try { return JSON.parse(localStorage.getItem(LEASE) || 'null'); } catch { return null; }
+}
+function writeLease() {
+  try { localStorage.setItem(LEASE, JSON.stringify({ id: TAB_ID, ts: Date.now() })); } catch {}
+}
+function releaseLease() {
+  const l = readLease();
+  if (l && l.id === TAB_ID) { try { localStorage.removeItem(LEASE); } catch {} }
+}
+function claimViewer() {
+  const l = readLease();
+  if (l && l.id !== TAB_ID && Date.now() - l.ts < 6000) return false;
+  writeLease();
+  return true;
+}
+
+setInterval(() => { if (state.running) writeLease(); }, 2000);
+window.addEventListener('pagehide', releaseLease);
+
+/* ------------------------------------------------------------------ */
 /* connection                                                          */
 /* ------------------------------------------------------------------ */
 
@@ -192,6 +221,12 @@ async function connect() {
   const cu = parseVars(check.text);
   log(`Authenticated${cu.pri ? ` (privilege ${cu.pri})` : ''}`);
 
+  if (!claimViewer()) {
+    showOverlay('Another tab is already viewing this camera. Close it, wait a few seconds, then press Reconnect.', true);
+    setDot('offline');
+    return false;
+  }
+
   await loadStatus();
   await loadParams();
   await detectCapabilities();
@@ -201,6 +236,7 @@ async function connect() {
 
 function disconnect() {
   state.running = false;
+  releaseLease();
   clearTimeout(state.pollTimer);
   state.pollTimer = null;
   state.streamAbort?.abort();
@@ -264,7 +300,7 @@ function applyParamsToForm(p) {
   if (p.contrast !== undefined) setRange('contrast', p.contrast);
   if (p.flip !== undefined) $('flip').value = p.flip;
   if (p.powerfreq !== undefined && ['0', '1', '2'].includes(p.powerfreq)) $('mode').value = p.powerfreq;
-  if (p.resolution !== undefined && ['15', '21'].includes(p.resolution)) $('resolution').value = p.resolution;
+  if (p.led !== undefined) $('led').checked = p.led === '1';
 }
 
 function setRange(id, v) {
@@ -296,7 +332,7 @@ async function detectCapabilities() {
   document.querySelectorAll('#dpad .pad').forEach((b) => { b.disabled = !ptz; });
   $('btnReboot').style.display = 'none';
 
-  const imageInputs = ['brightness', 'contrast', 'flip', 'mode', 'resolution'];
+  const imageInputs = ['brightness', 'contrast', 'flip', 'mode', 'led'];
   imageInputs.forEach((id) => { $(id).disabled = !state.caps.image; });
 }
 
@@ -306,8 +342,6 @@ async function detectCapabilities() {
 
 const STREAM_CANDIDATES = [
   { path: '/videostream.cgi', extra: { resolution: '32', rate: '0' } },
-  { path: '/videostream.cgi', extra: { resolution: '8', rate: '0' } },
-  { path: '/videostream.asf', extra: { resolution: '32', rate: '0' } },
 ];
 
 async function startVideo() {
@@ -375,6 +409,7 @@ function startMjpegStream(url) {
         el.canvas.height = bmp.height;
       }
       el.resStat.textContent = `${bmp.width}×${bmp.height}`;
+      $('frameSize').textContent = `${bmp.width}×${bmp.height}`;
       ctx.drawImage(bmp, 0, 0);
       bmp.close?.();
       hideOverlay();
@@ -452,6 +487,13 @@ function startPolling() {
 
   const grab = async () => {
     if (!state.running) return;
+
+    // Never poll from a background tab: this camera cannot take extra load.
+    if (document.hidden) {
+      state.pollTimer = setTimeout(grab, 1000);
+      return;
+    }
+
     const t0 = performance.now();
     let delay = 250;
     let status = 0;
@@ -479,6 +521,7 @@ function startPolling() {
         el.canvas.height = bmp.height;
       }
       el.resStat.textContent = `${bmp.width}×${bmp.height}`;
+      $('frameSize').textContent = `${bmp.width}×${bmp.height}`;
       ctx.drawImage(bmp, 0, 0);
       bmp.close?.();
 
@@ -495,7 +538,7 @@ function startPolling() {
 
       // Pace requests so the camera is never saturated.
       const target = 1000 / (state.targetFps || 4);
-      delay = Math.max(120, Math.min(2000, target - took));
+      delay = Math.max(50, Math.min(2000, target - took));
     } catch (err) {
       clearTimeout(timer);
       state.failCount += 1;
@@ -511,11 +554,25 @@ function startPolling() {
       log(`snapshot → ${err.name === 'AbortError' ? 'timed out' : err.message} (retry in ${backoff} ms)`, 'error');
       el.modeBadge.textContent = 'RECONNECTING';
       el.modeBadge.classList.add('stalled');
+
+      // After a few failures the camera's capture engine is usually wedged.
+      // Stop entirely rather than hammering it — that only makes it worse.
+      if (state.failCount >= 5) {
+        state.running = false;
+        setDot('offline');
+        showOverlay(
+          'The camera stopped sending frames and is not recovering. ' +
+          'Unplug it for a few seconds, then press Reconnect.',
+          true,
+        );
+        return;
+      }
+
       if (!state.gotFrame) {
         showOverlay(
           state.failCount < 3
             ? 'Waiting for the camera to send a frame…'
-            : 'The camera is not returning frames. It may need a power cycle (unplug it for a few seconds).',
+            : 'The camera is not returning frames. It may need a power cycle.',
           state.failCount >= 3,
         );
       }
@@ -608,28 +665,18 @@ function wireImageControls() {
   });
   $('flip').addEventListener('change', (e) => send(5, 'flip', e.target.value));
   $('mode').addEventListener('change', (e) => send(3, 'powerfreq', e.target.value));
-  $('resolution').addEventListener('change', (e) => send(0, 'resolution', e.target.value));
+  $('led').addEventListener('change', (e) => {
+    if (!state.caps.image) return;
+    const value = e.target.checked ? '1' : '0';
+    if (state.caps.camCtrl) api('/camera_control.cgi', { param: '6', value });
+    else api('/set_params.cgi', { led: value }).then((r) => log(`led=${value} → ${r.ok ? 'ok' : r.text.slice(0, 50)}`));
+  });
 
   $('refresh').value = String(state.targetFps);
   $('refresh').addEventListener('change', (e) => {
     state.targetFps = Number(e.target.value);
     try { localStorage.setItem('ypc.fps', String(state.targetFps)); } catch {}
     log(`Refresh set to ${state.targetFps} fps`);
-  });
-
-  $('btnApplyStream').addEventListener('click', async () => {
-    const res = $('resolution').value;
-    if (state.caps.image) {
-      const r = state.caps.camCtrl
-        ? await api('/camera_control.cgi', { param: '0', value: res })
-        : await api('/set_params.cgi', { resolution: res });
-      log(`resolution=${res} → ${r.ok ? 'ok' : r.text.slice(0, 50)}`);
-    }
-    disconnect();
-    setDot('connecting', `${cfg.host}:${cfg.port}`);
-    showOverlay('Restarting stream…');
-    await sleep(500);
-    await startVideo();
   });
 
   $('btnAlias').addEventListener('click', async () => {
