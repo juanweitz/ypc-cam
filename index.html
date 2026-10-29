@@ -97,24 +97,21 @@
       <div class="group">
         <h2>Stream</h2>
         <label class="row">
-          <span>Resolution</span>
-          <select id="resolution">
-            <option value="8">QVGA 320×240</option>
-            <option value="32">VGA 640×480</option>
+          <span>Refresh</span>
+          <select id="refresh">
+            <option value="2">Gentle — 2 fps</option>
+            <option value="4" selected>Balanced — 4 fps</option>
+            <option value="6">Fast — 6 fps</option>
           </select>
         </label>
         <label class="row">
-          <span>Frame rate</span>
-          <select id="rate">
-            <option value="0">Max</option>
-            <option value="1">20 fps</option>
-            <option value="3">15 fps</option>
-            <option value="6">10 fps</option>
-            <option value="11">5 fps</option>
-            <option value="13">3 fps</option>
-            <option value="15">1 fps</option>
+          <span>Frame size</span>
+          <select id="resolution">
+            <option value="15">640×480 (fast)</option>
+            <option value="21">1280×960 (sharp)</option>
           </select>
         </label>
+        <p class="hint">Frame size is stored on the camera and takes a few seconds to apply.</p>
         <button class="btn wide" id="btnApplyStream">Apply &amp; restart stream</button>
       </div>
 

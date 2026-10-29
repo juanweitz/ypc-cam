@@ -156,6 +156,9 @@ const state = {
   lastFrameAt: 0,
   fpsAvg: 0,
   lastLatency: 0,
+  failCount: 0,
+  gotFrame: false,
+  targetFps: Number(localStorage.getItem('ypc.fps') || 4),
   caps: {},
   params: {},
   recording: null,
@@ -260,8 +263,8 @@ function applyParamsToForm(p) {
   if (p.brightness !== undefined) setRange('brightness', p.brightness);
   if (p.contrast !== undefined) setRange('contrast', p.contrast);
   if (p.flip !== undefined) $('flip').value = p.flip;
-  if (p.mode !== undefined && ['0', '1', '2'].includes(p.mode)) $('mode').value = p.mode;
-  if (p.resolution !== undefined && ['8', '32'].includes(p.resolution)) $('resolution').value = p.resolution;
+  if (p.powerfreq !== undefined && ['0', '1', '2'].includes(p.powerfreq)) $('mode').value = p.powerfreq;
+  if (p.resolution !== undefined && ['15', '21'].includes(p.resolution)) $('resolution').value = p.resolution;
 }
 
 function setRange(id, v) {
@@ -276,25 +279,25 @@ function setRange(id, v) {
 /* ------------------------------------------------------------------ */
 
 async function detectCapabilities() {
-  // Probe one at a time — the camera's Boa server is easily overwhelmed.
-  // These probes are side-effect free: "stop up" and a no-op brightness write.
+  // Probe one at a time — this Boa server is easily overwhelmed.
+  // Never probe /reboot.cgi: on some firmware a GET reboots the camera.
   const ptz = await exists('/decoder_control.cgi', { command: '1', onestep: '1' });
   await sleep(120);
-  const img = await exists('/camera_control.cgi', { param: '1', value: state.params.brightness || '128' });
+  const camCtrl = await exists('/camera_control.cgi', { param: '1', value: state.params.brightness || '0' });
   await sleep(120);
-  const reboot = await exists('/reboot.cgi');
-  state.caps = { ptz, image: img, reboot };
-  log(`Capabilities: PTZ=${ptz} image=${img} reboot=${reboot}`);
+  const setParams = await exists('/set_params.cgi');
+  state.caps = { ptz, camCtrl, setParams, image: camCtrl || setParams, reboot: false };
+  log(`Capabilities: PTZ=${ptz} camera_control=${camCtrl} set_params=${setParams}`);
 
   $('dpad').classList.toggle('unsupported', !ptz);
   $('ptzHint').textContent = ptz
     ? 'Hold a direction to move, release to stop.'
-    : 'This model reports no pan/tilt motors.';
+    : 'This model has no pan/tilt motors.';
   document.querySelectorAll('#dpad .pad').forEach((b) => { b.disabled = !ptz; });
-  $('btnReboot').style.display = reboot ? '' : 'none';
+  $('btnReboot').style.display = 'none';
 
   const imageInputs = ['brightness', 'contrast', 'flip', 'mode', 'resolution'];
-  imageInputs.forEach((id) => { $(id).disabled = !img; });
+  imageInputs.forEach((id) => { $(id).disabled = !state.caps.image; });
 }
 
 /* ------------------------------------------------------------------ */
@@ -437,28 +440,40 @@ function startMjpegStream(url) {
 function startPolling() {
   state.mode = 'poll';
   el.modeBadge.hidden = false;
+  el.modeBadge.classList.remove('stalled');
   el.modeBadge.textContent = 'SNAPSHOT POLL';
   el.mjpeg.hidden = true;
   el.canvas.hidden = false;
 
   const ctx = el.canvas.getContext('2d');
   state.running = true;
+  state.failCount = 0;
+  state.gotFrame = false;
 
   const grab = async () => {
     if (!state.running) return;
     const t0 = performance.now();
-    let delay = 90;
+    let delay = 250;
     let status = 0;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 9000);
     try {
-      const res = await fetch(buildUrl('/snapshot.cgi', { _: Date.now() }), {
+      // No cache-buster params: this firmware rejects unknown query keys.
+      const res = await fetch(buildUrl('/snapshot.cgi'), {
         cache: 'no-store',
         mode: 'cors',
+        signal: ctrl.signal,
       });
       status = res.status;
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const blob = await res.blob();
-      if (!blob.size) throw new Error('empty frame');
-      const bmp = await createImageBitmap(blob);
+
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) {
+        const msg = new TextDecoder().decode(bytes.slice(0, 60)).trim();
+        throw new Error(msg || 'response was not a JPEG');
+      }
+
+      const bmp = await createImageBitmap(new Blob([bytes], { type: 'image/jpeg' }));
       if (el.canvas.width !== bmp.width || el.canvas.height !== bmp.height) {
         el.canvas.width = bmp.width;
         el.canvas.height = bmp.height;
@@ -466,26 +481,46 @@ function startPolling() {
       el.resStat.textContent = `${bmp.width}×${bmp.height}`;
       ctx.drawImage(bmp, 0, 0);
       bmp.close?.();
+
       hideOverlay();
+      state.failCount = 0;
+      state.gotFrame = true;
+      el.modeBadge.classList.remove('stalled');
+      el.modeBadge.textContent = 'SNAPSHOT POLL';
+
       const took = performance.now() - t0;
       state.lastLatency = Math.round(took);
       el.latency.textContent = state.lastLatency;
       noteFrame();
-      // Pull as fast as the camera can answer, with a floor to stay polite.
-      delay = Math.max(70, Math.min(1000, took * 0.9));
+
+      // Pace requests so the camera is never saturated.
+      const target = 1000 / (state.targetFps || 4);
+      delay = Math.max(120, Math.min(2000, target - took));
     } catch (err) {
-      log(`snapshot → ${err.message}`, 'error');
-      // Never hammer a locked-out camera: that can extend the ban.
+      clearTimeout(timer);
+      state.failCount += 1;
+      const backoff = Math.min(5000, 400 * 2 ** Math.max(0, state.failCount - 1));
+      delay = backoff;
+
       if (status === 401) {
-        showOverlay('Permission denied. The camera is blocking logins — wait ~10 minutes, then press Reconnect.', true);
+        showOverlay('Permission denied. Wait ~60 minutes for the camera to stop blocking logins, then press Reconnect.', true);
         setDot('offline');
-        state.pollTimer = setTimeout(grab, 15_000);
         return;
       }
-      if (state.mode === 'poll') {
-        delay = 800;
-        showOverlay('Lost contact with the camera — retrying…', true);
+
+      log(`snapshot → ${err.name === 'AbortError' ? 'timed out' : err.message} (retry in ${backoff} ms)`, 'error');
+      el.modeBadge.textContent = 'RECONNECTING';
+      el.modeBadge.classList.add('stalled');
+      if (!state.gotFrame) {
+        showOverlay(
+          state.failCount < 3
+            ? 'Waiting for the camera to send a frame…'
+            : 'The camera is not returning frames. It may need a power cycle (unplug it for a few seconds).',
+          state.failCount >= 3,
+        );
       }
+    } finally {
+      clearTimeout(timer);
     }
     state.pollTimer = setTimeout(grab, delay);
   };
@@ -549,39 +584,52 @@ function wireDpad() {
 
 function wireImageControls() {
   let timer = null;
-  const send = (param, value) => {
+
+  // Prefer camera_control.cgi; fall back to the same settings via set_params.cgi,
+  // which is all this firmware exposes.
+  const send = (ctrlParam, key, value) => {
     clearTimeout(timer);
     timer = setTimeout(async () => {
       if (!state.caps.image) return;
-      const r = await api('/camera_control.cgi', { param: String(param), value: String(value) }, 5000);
-      if (r.ok) log(`camera_control param=${param} value=${value} ok`);
-    }, 200);
+      const r = state.caps.camCtrl
+        ? await api('/camera_control.cgi', { param: String(ctrlParam), value: String(value) }, 6000)
+        : await api('/set_params.cgi', { [key]: String(value) }, 6000);
+      log(`${key}=${value} → ${r.ok ? 'ok' : r.text.slice(0, 50)}`, r.ok ? 'info' : 'error');
+    }, 250);
   };
 
   $('brightness').addEventListener('input', (e) => {
     $('brightnessVal').textContent = e.target.value;
-    send(1, e.target.value);
+    send(1, 'brightness', e.target.value);
   });
   $('contrast').addEventListener('input', (e) => {
     $('contrastVal').textContent = e.target.value;
-    send(2, e.target.value);
+    send(2, 'contrast', e.target.value);
   });
-  $('flip').addEventListener('change', (e) => send(5, e.target.value));
-  $('mode').addEventListener('change', (e) => send(3, e.target.value));
-  $('resolution').addEventListener('change', (e) => send(0, e.target.value));
+  $('flip').addEventListener('change', (e) => send(5, 'flip', e.target.value));
+  $('mode').addEventListener('change', (e) => send(3, 'powerfreq', e.target.value));
+  $('resolution').addEventListener('change', (e) => send(0, 'resolution', e.target.value));
+
+  $('refresh').value = String(state.targetFps);
+  $('refresh').addEventListener('change', (e) => {
+    state.targetFps = Number(e.target.value);
+    try { localStorage.setItem('ypc.fps', String(state.targetFps)); } catch {}
+    log(`Refresh set to ${state.targetFps} fps`);
+  });
 
   $('btnApplyStream').addEventListener('click', async () => {
     const res = $('resolution').value;
-    const rate = $('rate').value;
-    if (state.caps.image) await api('/camera_control.cgi', { param: '0', value: res });
-    const url = buildUrl('/videostream.cgi', { resolution: res, rate });
+    if (state.caps.image) {
+      const r = state.caps.camCtrl
+        ? await api('/camera_control.cgi', { param: '0', value: res })
+        : await api('/set_params.cgi', { resolution: res });
+      log(`resolution=${res} → ${r.ok ? 'ok' : r.text.slice(0, 50)}`);
+    }
     disconnect();
     setDot('connecting', `${cfg.host}:${cfg.port}`);
     showOverlay('Restarting stream…');
-    // Reuse the detected mode; just point the stream at the new settings.
-    const found = await findMjpegWith(buildUrl('/videostream.cgi', { resolution: res, rate }));
-    if (found) { startMjpegStream(found); }
-    else { startPolling(); }
+    await sleep(500);
+    await startVideo();
   });
 
   $('btnAlias').addEventListener('click', async () => {
@@ -602,21 +650,6 @@ function wireImageControls() {
   });
 }
 
-async function findMjpegWith(url) {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 3500);
-  try {
-    const res = await fetch(url, { cache: 'no-store', signal: ctrl.signal, mode: 'cors' });
-    const type = (res.headers.get('content-type') || '').toLowerCase();
-    return res.ok && (type.includes('multipart') || type.includes('mjpeg')) ? url : null;
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timer);
-    ctrl.abort();
-  }
-}
-
 /* ------------------------------------------------------------------ */
 /* snapshot / record / fullscreen                                      */
 /* ------------------------------------------------------------------ */
@@ -624,9 +657,12 @@ async function findMjpegWith(url) {
 function wireStageButtons() {
   $('btnSnap').addEventListener('click', async () => {
     try {
-      const res = await fetch(buildUrl('/snapshot.cgi', { _: Date.now() }), { cache: 'no-store' });
+      const res = await fetch(buildUrl('/snapshot.cgi'), { cache: 'no-store' });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const blob = await res.blob();
+      if (blob.type !== 'image/jpeg' || blob.size < 1024) {
+        throw new Error(await blob.text() || 'camera returned no picture');
+      }
       downloadBlob(blob, `ypc-${stamp()}.jpg`);
       log('Snapshot saved.');
     } catch (err) {
