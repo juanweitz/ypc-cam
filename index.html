@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>YPC Camera</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%233ea6ff'/%3E%3Ccircle cx='8' cy='8' r='3' fill='%230d1117'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="dot" id="dot"></span>
+    <h1>YPC Camera</h1>
+    <span class="host" id="hostLabel">—</span>
+  </div>
+  <div class="top-actions">
+    <button class="btn ghost" id="btnSettings">Settings</button>
+    <button class="btn" id="btnReconnect">Reconnect</button>
+  </div>
+</header>
+
+<main class="layout">
+  <section class="stage">
+    <div class="viewport" id="viewport">
+      <img id="mjpeg" alt="" hidden>
+      <canvas id="canvas" width="640" height="480"></canvas>
+      <div class="overlay" id="overlay">
+        <div class="spinner"></div>
+        <p id="overlayText">Connecting…</p>
+      </div>
+      <div class="badge" id="modeBadge" hidden></div>
+      <div class="rec-dot" id="recDot" hidden>REC</div>
+    </div>
+    <div class="stagebar">
+      <div class="stat"><span id="fps">0</span> fps</div>
+      <div class="stat"><span id="latency">–</span> ms</div>
+      <div class="stat" id="resStat">–</div>
+      <div class="spacer"></div>
+      <button class="btn ghost" id="btnSnap" title="Save a still">Snapshot</button>
+      <button class="btn ghost" id="btnRec" title="Record video">Record</button>
+      <button class="btn ghost" id="btnFull" title="Fullscreen">Fullscreen</button>
+    </div>
+  </section>
+
+  <aside class="panel">
+    <nav class="tabs">
+      <button class="tab active" data-tab="camera">Camera</button>
+      <button class="tab" data-tab="config">Config</button>
+      <button class="tab" data-tab="debug">Debug</button>
+    </nav>
+
+    <div class="tabpane active" id="pane-camera">
+      <div class="group">
+        <h2>Pan / Tilt</h2>
+        <div class="dpad" id="dpad">
+          <button data-cmd="0" data-stop="1" class="pad up" aria-label="Up">▲</button>
+          <button data-cmd="4" data-stop="5" class="pad left" aria-label="Left">◀</button>
+          <button data-cmd="stopall" class="pad center" aria-label="Stop" title="Stop all movement">●</button>
+          <button data-cmd="6" data-stop="7" class="pad right" aria-label="Right">▶</button>
+          <button data-cmd="2" data-stop="3" class="pad down" aria-label="Down">▼</button>
+        </div>
+        <p class="hint" id="ptzHint">Hold a direction to move, release to stop.</p>
+      </div>
+
+      <div class="group">
+        <h2>Image</h2>
+        <label class="row">
+          <span>Brightness</span>
+          <input type="range" id="brightness" min="0" max="255" value="128">
+          <output id="brightnessVal">128</output>
+        </label>
+        <label class="row">
+          <span>Contrast</span>
+          <input type="range" id="contrast" min="0" max="6" value="3">
+          <output id="contrastVal">3</output>
+        </label>
+        <label class="row">
+          <span>Orientation</span>
+          <select id="flip">
+            <option value="0">Normal</option>
+            <option value="1">Flip vertical</option>
+            <option value="2">Mirror</option>
+            <option value="3">Flip + mirror</option>
+          </select>
+        </label>
+        <label class="row">
+          <span>Lighting</span>
+          <select id="mode">
+            <option value="0">50 Hz</option>
+            <option value="1">60 Hz</option>
+            <option value="2">Outdoor</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="group">
+        <h2>Stream</h2>
+        <label class="row">
+          <span>Resolution</span>
+          <select id="resolution">
+            <option value="8">QVGA 320×240</option>
+            <option value="32">VGA 640×480</option>
+          </select>
+        </label>
+        <label class="row">
+          <span>Frame rate</span>
+          <select id="rate">
+            <option value="0">Max</option>
+            <option value="1">20 fps</option>
+            <option value="3">15 fps</option>
+            <option value="6">10 fps</option>
+            <option value="11">5 fps</option>
+            <option value="13">3 fps</option>
+            <option value="15">1 fps</option>
+          </select>
+        </label>
+        <button class="btn wide" id="btnApplyStream">Apply &amp; restart stream</button>
+      </div>
+
+      <div class="group">
+        <h2>Device</h2>
+        <label class="row">
+          <span>Name</span>
+          <input type="text" id="alias" maxlength="20" placeholder="Camera name">
+        </label>
+        <button class="btn wide" id="btnAlias">Save name</button>
+        <button class="btn wide danger" id="btnReboot">Reboot camera</button>
+      </div>
+    </div>
+
+    <div class="tabpane" id="pane-config">
+      <div class="group">
+        <h2>Device status</h2>
+        <dl class="kv" id="statusList"><dt>—</dt><dd></dd></dl>
+      </div>
+      <div class="group">
+        <h2>All parameters</h2>
+        <p class="hint">Raw <code>get_params.cgi</code> output from the camera.</p>
+        <pre class="raw" id="paramsRaw">—</pre>
+      </div>
+    </div>
+
+    <div class="tabpane" id="pane-debug">
+      <div class="group">
+        <h2>Request</h2>
+        <div class="inline">
+          <input type="text" id="debugPath" value="/get_status.cgi" spellcheck="false">
+          <button class="btn" id="btnSend">Send</button>
+        </div>
+        <p class="hint">Path relative to the camera. <code>user</code>/<code>pwd</code> are added automatically.</p>
+        <pre class="raw" id="debugOut">—</pre>
+      </div>
+      <div class="group">
+        <h2>Log</h2>
+        <pre class="raw log" id="log"></pre>
+      </div>
+    </div>
+  </aside>
+</main>
+
+<dialog id="settingsDlg">
+  <form method="dialog" id="settingsForm">
+    <h2>Camera connection</h2>
+    <label class="field">
+      <span>Address</span>
+      <input id="cfgHost" required placeholder="192.168.1.1" autocomplete="off">
+    </label>
+    <label class="field">
+      <span>Port</span>
+      <input id="cfgPort" type="number" min="1" max="65535" placeholder="36299">
+    </label>
+    <label class="field">
+      <span>Username</span>
+      <input id="cfgUser" placeholder="admin" autocomplete="username">
+    </label>
+    <label class="field">
+      <span>Password</span>
+      <input id="cfgPwd" type="password" placeholder="(empty)" autocomplete="current-password">
+    </label>
+    <p class="hint">The camera is an open access point. Credentials never leave your browser.</p>
+    <div class="dlg-actions">
+      <button value="cancel" class="btn ghost" formnovalidate>Cancel</button>
+      <button value="save" class="btn" id="btnSaveCfg">Connect</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="app.js"></script>
+</body>
+</html>

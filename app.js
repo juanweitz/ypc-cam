@@ -1,0 +1,778 @@
+/* YPC camera controller — dependency-free.
+ *
+ * The camera runs a Boa web server (default TCP 36299) exposing a small
+ * Tenvis/Instar-style CGI API:
+ *   /check_user.cgi     verify credentials
+ *   /get_status.cgi     device status
+ *   /get_params.cgi     full configuration
+ *   /set_params.cgi     change configuration
+ *   /snapshot.cgi       single JPEG frame
+ *   /decoder_control.cgi  PTZ (if the model has motors)
+ *   /camera_control.cgi   brightness / contrast / flip / resolution
+ *
+ * Boa answers with `Access-Control-Allow-Origin: *`, so a page from any
+ * origin (e.g. http://localhost:8000) can talk to it directly.
+ */
+
+'use strict';
+
+/* ------------------------------------------------------------------ */
+/* config                                                              */
+/* ------------------------------------------------------------------ */
+
+const DEFAULTS = {
+  host: '192.168.1.1',
+  port: '36299',
+  user: 'admin',
+  pwd: '',
+};
+
+const cfg = { ...DEFAULTS, ...readCfg() };
+
+function readCfg() {
+  try { return JSON.parse(localStorage.getItem('ypc.cfg') || '{}'); }
+  catch { return {}; }
+}
+function saveCfg() {
+  try { localStorage.setItem('ypc.cfg', JSON.stringify(cfg)); } catch {}
+}
+
+/* ------------------------------------------------------------------ */
+/* dom helpers                                                         */
+/* ------------------------------------------------------------------ */
+
+const $ = (id) => document.getElementById(id);
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const el = {
+  dot: $('dot'),
+  hostLabel: $('hostLabel'),
+  overlay: $('overlay'),
+  overlayText: $('overlayText'),
+  mjpeg: $('mjpeg'),
+  canvas: $('canvas'),
+  modeBadge: $('modeBadge'),
+  recDot: $('recDot'),
+  fps: $('fps'),
+  latency: $('latency'),
+  resStat: $('resStat'),
+  log: $('log'),
+  paramsRaw: $('paramsRaw'),
+  statusList: $('statusList'),
+  debugPath: $('debugPath'),
+  debugOut: $('debugOut'),
+  settingsDlg: $('settingsDlg'),
+};
+
+function log(msg, level = 'info') {
+  const t = new Date().toLocaleTimeString();
+  const line = `[${t}] ${msg}`;
+  el.log.textContent += (el.log.textContent ? '\n' : '') + line;
+  el.log.scrollTop = el.log.scrollHeight;
+  if (level === 'error') console.error(msg); else console.log(msg);
+}
+
+function setDot(state, label) {
+  el.dot.className = 'dot ' + state;
+  if (label) el.hostLabel.textContent = label;
+}
+
+function showOverlay(text, isError = false) {
+  el.overlay.classList.remove('hide');
+  el.overlayText.textContent = text;
+  el.overlayText.className = isError ? 'err' : '';
+}
+
+function hideOverlay() {
+  el.overlay.classList.add('hide');
+}
+
+/* ------------------------------------------------------------------ */
+/* transport                                                           */
+/* ------------------------------------------------------------------ */
+
+function base() {
+  return `http://${cfg.host}:${cfg.port}`;
+}
+
+function buildUrl(path, extra = {}) {
+  const q = new URLSearchParams({ user: cfg.user, pwd: cfg.pwd, ...extra });
+  return `${base()}${path}?${q.toString()}`;
+}
+
+/** Text request. Resolves with {status, ok, text}. Never throws except on network error. */
+async function api(path, extra = {}, timeout = 7000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeout);
+  try {
+    const res = await fetch(buildUrl(path, extra), {
+      cache: 'no-store',
+      signal: ctrl.signal,
+      mode: 'cors',
+    });
+    const text = await res.text();
+    const denied = /^\s*(Permission denied|File not found)/i.test(text);
+    const ok = res.ok && !denied;
+    if (!ok) log(`${path} → ${res.status} ${text.slice(0, 60)}`, 'error');
+    return { status: res.status, ok, text };
+  } catch (err) {
+    log(`${path} → network error: ${err.name === 'AbortError' ? 'timeout' : err.message}`, 'error');
+    return { status: 0, ok: false, text: '', error: err };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** True when an endpoint exists (404 "File not found" means it does not). */
+async function exists(path, extra = {}) {
+  const r = await api(path, extra, 4000);
+  return r.status !== 0 && !/File not found/i.test(r.text);
+}
+
+/** Parse `var key=value;` / `key=value` responses into an object. */
+function parseVars(text) {
+  const out = {};
+  const re = /(?:var\s+)?([A-Za-z0-9_.]+)\s*=\s*("(?:[^"\\]|\\.)*"|[^;\n]*);?/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    let v = m[2].trim();
+    if (v.startsWith('"') && v.endsWith('"')) v = v.slice(1, -1);
+    out[m[1]] = v;
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------------ */
+/* connection                                                          */
+/* ------------------------------------------------------------------ */
+
+const state = {
+  mode: null,          // 'mjpeg' | 'poll' | null
+  streamUrl: null,
+  running: false,
+  pollTimer: null,
+  rafId: null,
+  lastFrameAt: 0,
+  fpsAvg: 0,
+  lastLatency: 0,
+  caps: {},
+  params: {},
+  recording: null,
+  recorder: null,
+  chunks: [],
+  canRecord: true,
+};
+
+async function connect() {
+  disconnect();
+  setDot('connecting', `${cfg.host}:${cfg.port}`);
+  showOverlay('Connecting…');
+  log(`Connecting to ${base()} as "${cfg.user}"`);
+
+  const check = await api('/check_user.cgi');
+  if (!check.ok) {
+    if (check.status === 401) {
+      showOverlay('Permission denied. Wrong password, or the camera is temporarily blocking logins after too many attempts (wait ~10 min).', true);
+      setDot('offline');
+    } else if (check.status === 0) {
+      showOverlay('Camera unreachable. Are you connected to the YPC_… Wi-Fi?', true);
+      setDot('offline');
+    } else {
+      showOverlay(`Unexpected reply from camera (HTTP ${check.status}).`, true);
+      setDot('offline');
+    }
+    return false;
+  }
+
+  setDot('online');
+  const cu = parseVars(check.text);
+  log(`Authenticated${cu.pri ? ` (privilege ${cu.pri})` : ''}`);
+
+  await loadStatus();
+  await loadParams();
+  await detectCapabilities();
+  await startVideo();
+  return true;
+}
+
+function disconnect() {
+  state.running = false;
+  clearTimeout(state.pollTimer);
+  state.pollTimer = null;
+  state.streamAbort?.abort();
+  state.streamAbort = null;
+  if (state.rafId) cancelAnimationFrame(state.rafId);
+  state.rafId = null;
+  if (state.recorder && state.recorder.state !== 'inactive') state.recorder.stop();
+  state.recorder = null;
+  state.recording = null;
+  el.recDot.hidden = true;
+  el.mjpeg.removeAttribute('src');
+  el.mjpeg.hidden = true;
+  const ctx = el.canvas.getContext('2d');
+  ctx.clearRect(0, 0, el.canvas.width, el.canvas.height);
+  state.mode = null;
+  state.streamUrl = null;
+  state.fpsAvg = 0;
+  state.lastFrameAt = 0;
+  el.fps.textContent = '0';
+  el.latency.textContent = '–';
+}
+
+/* ------------------------------------------------------------------ */
+/* status + params                                                     */
+/* ------------------------------------------------------------------ */
+
+async function loadStatus() {
+  const r = await api('/get_status.cgi');
+  if (!r.ok) return;
+  const s = parseVars(r.text);
+  const epoch = s.now || s.time;
+  const rows = [
+    ['Name', s.alias],
+    ['Device ID', s.id],
+    ['Firmware', s.sys_ver],
+    ['Web UI', s.app_ver],
+    ['Camera time', epoch ? new Date(Number(epoch) * 1000).toLocaleString() : ''],
+    ['Alarm', s.alarm_status !== undefined ? s.alarm_status : s.alarm],
+    ['DDNS', s.ddns_status],
+    ['UPnP', s.upnp_status],
+  ].filter(([, v]) => v !== undefined && v !== '');
+
+  el.statusList.innerHTML = rows
+    .map(([k, v]) => `<dt>${k}</dt><dd>${escapeHtml(String(v))}</dd>`)
+    .join('');
+
+  if (s.alias) document.title = `${s.alias} — YPC Camera`;
+}
+
+async function loadParams() {
+  const r = await api('/get_params.cgi');
+  if (!r.ok) { el.paramsRaw.textContent = 'Not available for this account.'; return; }
+  state.params = parseVars(r.text);
+  el.paramsRaw.textContent = r.text.trim();
+  applyParamsToForm(state.params);
+}
+
+function applyParamsToForm(p) {
+  if (p.alias !== undefined) $('alias').value = p.alias;
+  if (p.brightness !== undefined) setRange('brightness', p.brightness);
+  if (p.contrast !== undefined) setRange('contrast', p.contrast);
+  if (p.flip !== undefined) $('flip').value = p.flip;
+  if (p.mode !== undefined && ['0', '1', '2'].includes(p.mode)) $('mode').value = p.mode;
+  if (p.resolution !== undefined && ['8', '32'].includes(p.resolution)) $('resolution').value = p.resolution;
+}
+
+function setRange(id, v) {
+  const input = $(id);
+  input.value = v;
+  const out = $(id + 'Val');
+  if (out) out.textContent = v;
+}
+
+/* ------------------------------------------------------------------ */
+/* capability probing                                                  */
+/* ------------------------------------------------------------------ */
+
+async function detectCapabilities() {
+  // Probe one at a time — the camera's Boa server is easily overwhelmed.
+  // These probes are side-effect free: "stop up" and a no-op brightness write.
+  const ptz = await exists('/decoder_control.cgi', { command: '1', onestep: '1' });
+  await sleep(120);
+  const img = await exists('/camera_control.cgi', { param: '1', value: state.params.brightness || '128' });
+  await sleep(120);
+  const reboot = await exists('/reboot.cgi');
+  state.caps = { ptz, image: img, reboot };
+  log(`Capabilities: PTZ=${ptz} image=${img} reboot=${reboot}`);
+
+  $('dpad').classList.toggle('unsupported', !ptz);
+  $('ptzHint').textContent = ptz
+    ? 'Hold a direction to move, release to stop.'
+    : 'This model reports no pan/tilt motors.';
+  document.querySelectorAll('#dpad .pad').forEach((b) => { b.disabled = !ptz; });
+  $('btnReboot').style.display = reboot ? '' : 'none';
+
+  const imageInputs = ['brightness', 'contrast', 'flip', 'mode', 'resolution'];
+  imageInputs.forEach((id) => { $(id).disabled = !img; });
+}
+
+/* ------------------------------------------------------------------ */
+/* video                                                               */
+/* ------------------------------------------------------------------ */
+
+const STREAM_CANDIDATES = [
+  { path: '/videostream.cgi', extra: { resolution: '32', rate: '0' } },
+  { path: '/videostream.cgi', extra: { resolution: '8', rate: '0' } },
+  { path: '/videostream.asf', extra: { resolution: '32', rate: '0' } },
+];
+
+async function startVideo() {
+  showOverlay('Starting video…');
+  const stream = await findMjpeg();
+  if (stream) {
+    startMjpegStream(stream);
+  } else {
+    log('No MJPEG endpoint found — falling back to snapshot polling.');
+    startPolling();
+  }
+}
+
+/** Probe stream endpoints. Returns a URL whose response is multipart MJPEG. */
+async function findMjpeg() {
+  for (const cand of STREAM_CANDIDATES) {
+    const url = buildUrl(cand.path, cand.extra);
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 3500);
+    try {
+      const res = await fetch(url, { cache: 'no-store', signal: ctrl.signal, mode: 'cors' });
+      const type = (res.headers.get('content-type') || '').toLowerCase();
+      const ok = res.ok && (type.includes('multipart') || type.includes('mjpeg'));
+      log(`probe ${cand.path} → ${res.status} ${type || '(no type)'}`);
+      if (ok) return url;
+    } catch (err) {
+      log(`probe ${cand.path} → ${err.name === 'AbortError' ? 'timeout' : err.message}`);
+    } finally {
+      clearTimeout(timer);
+      ctrl.abort();
+    }
+  }
+  return null;
+}
+
+/* ---- MJPEG: read the multipart stream ourselves so we get every frame,
+ *      true fps, and a canvas we can record from. ---------------------- */
+
+function findByte(buf, a, b, from = 0) {
+  for (let i = from; i < buf.length - 1; i++) if (buf[i] === a && buf[i + 1] === b) return i;
+  return -1;
+}
+
+function startMjpegStream(url) {
+  state.mode = 'mjpeg';
+  state.streamUrl = url;
+  state.running = true;
+  el.modeBadge.hidden = false;
+  el.modeBadge.textContent = 'MJPEG';
+  el.mjpeg.hidden = true;
+  el.canvas.hidden = false;
+
+  const ctx = el.canvas.getContext('2d');
+  const ctrl = new AbortController();
+  state.streamAbort = ctrl;
+  let busy = false;
+
+  const draw = async (bytes) => {
+    if (busy) return;              // drop frames while the decoder is behind
+    busy = true;
+    try {
+      const bmp = await createImageBitmap(new Blob([bytes], { type: 'image/jpeg' }));
+      if (el.canvas.width !== bmp.width || el.canvas.height !== bmp.height) {
+        el.canvas.width = bmp.width;
+        el.canvas.height = bmp.height;
+      }
+      el.resStat.textContent = `${bmp.width}×${bmp.height}`;
+      ctx.drawImage(bmp, 0, 0);
+      bmp.close?.();
+      hideOverlay();
+      noteFrame();
+    } catch (err) {
+      log(`frame decode failed: ${err.message}`, 'error');
+    } finally {
+      busy = false;
+    }
+  };
+
+  const read = async () => {
+    let status = 0;
+    try {
+      const res = await fetch(url, { cache: 'no-store', signal: ctrl.signal, mode: 'cors' });
+      status = res.status;
+      if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+
+      const reader = res.body.getReader();
+      let buf = new Uint8Array(0);
+
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+
+        const merged = new Uint8Array(buf.length + value.length);
+        merged.set(buf, 0);
+        merged.set(value, buf.length);
+        buf = merged;
+
+        // Extract every complete JPEG (SOI … EOI). 0xFFD9 cannot occur inside
+        // entropy-coded data, so this is safe for baseline/progressive JPEG.
+        for (;;) {
+          const start = findByte(buf, 0xff, 0xd8);
+          if (start < 0) break;
+          const end = findByte(buf, 0xff, 0xd9, start + 2);
+          if (end < 0) break;
+          const jpg = buf.slice(start, end + 2);
+          buf = buf.slice(end + 2);
+          draw(jpg);
+        }
+        // Guard against unbounded growth if the stream is not what we think.
+        if (buf.length > 4_000_000) buf = new Uint8Array(0);
+      }
+    } catch (err) {
+      if (ctrl.signal.aborted || !state.running) return;
+      log(`MJPEG stream ended: ${err.message}`, 'error');
+      if (status === 401) {
+        showOverlay('Permission denied. The camera is blocking logins — wait ~10 minutes, then press Reconnect.', true);
+        setDot('offline');
+        return;
+      }
+      showOverlay('Stream interrupted — retrying…', true);
+      setTimeout(() => {
+        if (state.running && state.mode === 'mjpeg') startMjpegStream(url + '&_=' + Date.now());
+      }, 1500);
+    }
+  };
+  read();
+}
+
+function startPolling() {
+  state.mode = 'poll';
+  el.modeBadge.hidden = false;
+  el.modeBadge.textContent = 'SNAPSHOT POLL';
+  el.mjpeg.hidden = true;
+  el.canvas.hidden = false;
+
+  const ctx = el.canvas.getContext('2d');
+  state.running = true;
+
+  const grab = async () => {
+    if (!state.running) return;
+    const t0 = performance.now();
+    let delay = 90;
+    let status = 0;
+    try {
+      const res = await fetch(buildUrl('/snapshot.cgi', { _: Date.now() }), {
+        cache: 'no-store',
+        mode: 'cors',
+      });
+      status = res.status;
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blob = await res.blob();
+      if (!blob.size) throw new Error('empty frame');
+      const bmp = await createImageBitmap(blob);
+      if (el.canvas.width !== bmp.width || el.canvas.height !== bmp.height) {
+        el.canvas.width = bmp.width;
+        el.canvas.height = bmp.height;
+      }
+      el.resStat.textContent = `${bmp.width}×${bmp.height}`;
+      ctx.drawImage(bmp, 0, 0);
+      bmp.close?.();
+      hideOverlay();
+      const took = performance.now() - t0;
+      state.lastLatency = Math.round(took);
+      el.latency.textContent = state.lastLatency;
+      noteFrame();
+      // Pull as fast as the camera can answer, with a floor to stay polite.
+      delay = Math.max(70, Math.min(1000, took * 0.9));
+    } catch (err) {
+      log(`snapshot → ${err.message}`, 'error');
+      // Never hammer a locked-out camera: that can extend the ban.
+      if (status === 401) {
+        showOverlay('Permission denied. The camera is blocking logins — wait ~10 minutes, then press Reconnect.', true);
+        setDot('offline');
+        state.pollTimer = setTimeout(grab, 15_000);
+        return;
+      }
+      if (state.mode === 'poll') {
+        delay = 800;
+        showOverlay('Lost contact with the camera — retrying…', true);
+      }
+    }
+    state.pollTimer = setTimeout(grab, delay);
+  };
+  grab();
+}
+
+function noteFrame() {
+  const now = performance.now();
+  if (state.lastFrameAt) {
+    const dt = now - state.lastFrameAt;
+    if (dt > 0) {
+      const inst = 1000 / dt;
+      state.fpsAvg = state.fpsAvg ? state.fpsAvg * 0.85 + inst * 0.15 : inst;
+    }
+  }
+  state.lastFrameAt = now;
+}
+
+setInterval(() => {
+  el.fps.textContent = state.fpsAvg ? state.fpsAvg.toFixed(1) : '0';
+  if (state.mode === 'mjpeg') el.latency.textContent = '–';
+}, 500);
+
+/* ------------------------------------------------------------------ */
+/* controls                                                            */
+/* ------------------------------------------------------------------ */
+
+async function ptzCommand(command, onestep = 0) {
+  if (!state.caps.ptz) return;
+  await api('/decoder_control.cgi', { command: String(command), onestep: String(onestep) }, 4000);
+}
+
+function wireDpad() {
+  const pads = document.querySelectorAll('#dpad .pad');
+  pads.forEach((btn) => {
+    const cmd = btn.dataset.cmd;
+    const stop = btn.dataset.stop;
+
+    const press = (e) => {
+      e.preventDefault();
+      if (btn.disabled) return;
+      btn.classList.add('pressed');
+      if (cmd === 'stopall') {
+        [1, 3, 5, 7].forEach((c) => ptzCommand(c, 1));
+      } else {
+        ptzCommand(cmd, 0);
+      }
+    };
+    const release = (e) => {
+      if (e) e.preventDefault();
+      btn.classList.remove('pressed');
+      if (stop) ptzCommand(stop, 1);
+    };
+
+    btn.addEventListener('pointerdown', press);
+    btn.addEventListener('pointerup', release);
+    btn.addEventListener('pointerleave', release);
+    btn.addEventListener('pointercancel', release);
+  });
+}
+
+function wireImageControls() {
+  let timer = null;
+  const send = (param, value) => {
+    clearTimeout(timer);
+    timer = setTimeout(async () => {
+      if (!state.caps.image) return;
+      const r = await api('/camera_control.cgi', { param: String(param), value: String(value) }, 5000);
+      if (r.ok) log(`camera_control param=${param} value=${value} ok`);
+    }, 200);
+  };
+
+  $('brightness').addEventListener('input', (e) => {
+    $('brightnessVal').textContent = e.target.value;
+    send(1, e.target.value);
+  });
+  $('contrast').addEventListener('input', (e) => {
+    $('contrastVal').textContent = e.target.value;
+    send(2, e.target.value);
+  });
+  $('flip').addEventListener('change', (e) => send(5, e.target.value));
+  $('mode').addEventListener('change', (e) => send(3, e.target.value));
+  $('resolution').addEventListener('change', (e) => send(0, e.target.value));
+
+  $('btnApplyStream').addEventListener('click', async () => {
+    const res = $('resolution').value;
+    const rate = $('rate').value;
+    if (state.caps.image) await api('/camera_control.cgi', { param: '0', value: res });
+    const url = buildUrl('/videostream.cgi', { resolution: res, rate });
+    disconnect();
+    setDot('connecting', `${cfg.host}:${cfg.port}`);
+    showOverlay('Restarting stream…');
+    // Reuse the detected mode; just point the stream at the new settings.
+    const found = await findMjpegWith(buildUrl('/videostream.cgi', { resolution: res, rate }));
+    if (found) { startMjpegStream(found); }
+    else { startPolling(); }
+  });
+
+  $('btnAlias').addEventListener('click', async () => {
+    const name = $('alias').value.trim();
+    if (!name) return;
+    const r = await api('/set_params.cgi', { alias: name });
+    log(`set_params alias="${name}" → ${r.ok ? 'ok' : r.text.slice(0, 60)}`);
+    await loadStatus();
+  });
+
+  $('btnReboot').addEventListener('click', async () => {
+    if (!confirm('Reboot the camera now? Video will drop for about a minute.')) return;
+    const r = await api('/reboot.cgi', {}, 4000);
+    if (!r.ok) { log('Reboot was refused by the camera.', 'error'); return; }
+    log('Reboot requested.');
+    showOverlay('Camera rebooting…', true);
+    setDot('connecting');
+  });
+}
+
+async function findMjpegWith(url) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 3500);
+  try {
+    const res = await fetch(url, { cache: 'no-store', signal: ctrl.signal, mode: 'cors' });
+    const type = (res.headers.get('content-type') || '').toLowerCase();
+    return res.ok && (type.includes('multipart') || type.includes('mjpeg')) ? url : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+    ctrl.abort();
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* snapshot / record / fullscreen                                      */
+/* ------------------------------------------------------------------ */
+
+function wireStageButtons() {
+  $('btnSnap').addEventListener('click', async () => {
+    try {
+      const res = await fetch(buildUrl('/snapshot.cgi', { _: Date.now() }), { cache: 'no-store' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blob = await res.blob();
+      downloadBlob(blob, `ypc-${stamp()}.jpg`);
+      log('Snapshot saved.');
+    } catch (err) {
+      log(`Snapshot failed: ${err.message}`, 'error');
+    }
+  });
+
+  $('btnRec').addEventListener('click', () => {
+    if (state.recording) stopRecording(); else startRecording();
+  });
+
+  $('btnFull').addEventListener('click', () => {
+    const vp = $('viewport');
+    if (document.fullscreenElement) document.exitFullscreen();
+    else vp.requestFullscreen?.();
+  });
+}
+
+function startRecording() {
+  if (!state.canRecord) return;
+  if (!el.canvas.captureStream || typeof MediaRecorder === 'undefined') {
+    log('Recording is not supported by this browser.', 'error');
+    return;
+  }
+  const mime = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm']
+    .find((m) => MediaRecorder.isTypeSupported(m));
+  if (!mime) { log('No usable video encoder in this browser.', 'error'); return; }
+
+  const stream = el.canvas.captureStream(20);
+  const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 2_000_000 });
+  state.chunks = [];
+  rec.ondataavailable = (e) => { if (e.data.size) state.chunks.push(e.data); };
+  rec.onstop = () => {
+    const blob = new Blob(state.chunks, { type: mime });
+    downloadBlob(blob, `ypc-${stamp()}.webm`);
+    state.chunks = [];
+    log('Recording saved.');
+  };
+  rec.start(1000);
+  state.recorder = rec;
+  state.recording = true;
+  el.recDot.hidden = false;
+  $('btnRec').textContent = 'Stop';
+  $('btnRec').classList.add('active');
+  log('Recording started.');
+}
+
+function stopRecording() {
+  state.recording = false;
+  el.recDot.hidden = true;
+  $('btnRec').textContent = 'Record';
+  $('btnRec').classList.remove('active');
+  if (state.recorder && state.recorder.state !== 'inactive') state.recorder.stop();
+}
+
+function downloadBlob(blob, name) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10_000);
+}
+
+function stamp() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+/* ------------------------------------------------------------------ */
+/* settings dialog + tabs + debug                                      */
+/* ------------------------------------------------------------------ */
+
+function openSettings() {
+  $('cfgHost').value = cfg.host;
+  $('cfgPort').value = cfg.port;
+  $('cfgUser').value = cfg.user;
+  $('cfgPwd').value = cfg.pwd;
+  el.settingsDlg.showModal();
+}
+
+function wireSettings() {
+  $('btnSettings').addEventListener('click', openSettings);
+
+  $('settingsForm').addEventListener('submit', (e) => {
+    const action = e.submitter?.value;
+    if (action === 'cancel') return;
+    e.preventDefault();
+    cfg.host = $('cfgHost').value.trim() || DEFAULTS.host;
+    cfg.port = $('cfgPort').value.trim() || DEFAULTS.port;
+    cfg.user = $('cfgUser').value.trim() || DEFAULTS.user;
+    cfg.pwd = $('cfgPwd').value;
+    saveCfg();
+    el.settingsDlg.close();
+    connect();
+  });
+
+  $('btnReconnect').addEventListener('click', connect);
+
+  document.querySelectorAll('.tab').forEach((tab) => {
+    tab.addEventListener('click', () => {
+      document.querySelectorAll('.tab').forEach((t) => t.classList.remove('active'));
+      document.querySelectorAll('.tabpane').forEach((p) => p.classList.remove('active'));
+      tab.classList.add('active');
+      $('pane-' + tab.dataset.tab).classList.add('active');
+    });
+  });
+
+  $('btnSend').addEventListener('click', async () => {
+    const path = $('debugPath').value.trim();
+    if (!path) return;
+    const r = await api(path);
+    el.debugOut.textContent = `HTTP ${r.status}\n\n${r.text.slice(0, 8000)}`;
+  });
+  $('debugPath').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') $('btnSend').click();
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* boot                                                                */
+/* ------------------------------------------------------------------ */
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+(function boot() {
+  wireSettings();
+  wireDpad();
+  wireImageControls();
+  wireStageButtons();
+
+  // URL overrides: ?host=…&port=…&user=…&pwd=…
+  const q = new URLSearchParams(location.search);
+  let changed = false;
+  for (const k of ['host', 'port', 'user', 'pwd']) {
+    if (q.has(k)) { cfg[k] = q.get(k); changed = true; }
+  }
+  if (changed) saveCfg();
+
+  const hasSaved = !!localStorage.getItem('ypc.cfg');
+  if (!hasSaved) {
+    openSettings();
+    showOverlay('Set the camera address to begin.');
+    return;
+  }
+  connect();
+})();
