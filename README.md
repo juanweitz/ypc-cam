@@ -23,6 +23,20 @@ python3 -m http.server 8000
 
 Then visit <http://localhost:8000>.
 
+### Install it as an app
+
+The page is a PWA (`manifest.webmanifest` + `sw.js`). With the local server
+running, open <http://localhost:8000> and press **Install** in the header (or
+the install icon in the address bar). It gets its own window, icon and entry in
+your app launcher.
+
+The service worker caches the UI, so the installed app still opens when the
+local server is not running; camera traffic is never intercepted.
+
+Install it from `http://localhost`, not from the GitHub Pages URL: an app
+installed from Pages runs at an HTTPS origin and hits the same mixed-content
+block described below.
+
 On first load you get a connection dialog. Defaults are already correct for
 this camera:
 

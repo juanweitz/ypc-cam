@@ -845,6 +845,45 @@ function wireSettings() {
 }
 
 /* ------------------------------------------------------------------ */
+/* installable app (PWA)                                               */
+/* ------------------------------------------------------------------ */
+
+let installPrompt = null;
+
+function wireInstall() {
+  const btn = $('btnInstall');
+
+  window.addEventListener('beforeinstallprompt', (e) => {
+    e.preventDefault();
+    installPrompt = e;
+    btn.hidden = false;
+    log('Ready to install. Use the Install button or your browser menu.');
+  });
+
+  btn.addEventListener('click', async () => {
+    if (!installPrompt) return;
+    installPrompt.prompt();
+    const { outcome } = await installPrompt.userChoice;
+    log(`Install ${outcome}.`);
+    installPrompt = null;
+    btn.hidden = true;
+  });
+
+  window.addEventListener('appinstalled', () => {
+    btn.hidden = true;
+    log('Installed as an app.');
+  });
+
+  // A service worker makes the UI load offline. It only handles same-origin
+  // requests; camera traffic is never intercepted.
+  if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
+    navigator.serviceWorker.register('sw.js').catch((err) => {
+      log(`Service worker failed: ${err.message} (install unavailable)`, 'error');
+    });
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* boot                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -857,6 +896,7 @@ function escapeHtml(s) {
   wireDpad();
   wireImageControls();
   wireStageButtons();
+  wireInstall();
 
   // URL overrides: ?host=…&port=…&user=…&pwd=…
   const q = new URLSearchParams(location.search);

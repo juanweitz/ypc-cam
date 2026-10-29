@@ -4,6 +4,13 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>YPC Camera</title>
+<meta name="theme-color" content="#161b22">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="YPC Cam">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%233ea6ff'/%3E%3Ccircle cx='8' cy='8' r='3' fill='%230d1117'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="style.css">
 </head>
@@ -15,6 +22,7 @@
     <span class="host" id="hostLabel">—</span>
   </div>
   <div class="top-actions">
+    <button class="btn ghost" id="btnInstall" hidden>Install</button>
     <button class="btn ghost" id="btnSettings">Settings</button>
     <button class="btn" id="btnReconnect">Reconnect</button>
   </div>
